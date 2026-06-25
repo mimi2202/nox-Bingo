@@ -47,7 +47,7 @@ export interface Room {
 }
 
 export type ServerMessage =
-  | { type: 'room_created'; roomCode: string; playerId: string }
+  | { type: 'room_created'; roomCode: string; playerId: string; hostId?: string }
   | { type: 'player_joined'; playerId: string; playerName: string; playerCount: number }
   | { type: 'player_left'; playerId: string; playerName: string; playerCount: number }
   | { type: 'game_starting'; countdown: number }
@@ -57,7 +57,7 @@ export type ServerMessage =
   | { type: 'nox_bonus'; winnerId: string; winnerName: string; cardIndex: number }
   | { type: 'game_over'; winnerId: string | null; winnerName: string | null }
   | { type: 'error'; message: string }
-  | { type: 'players_update'; players: { id: string; name: string }[] };
+  | { type: 'players_update'; players: { id: string; name: string }[]; hostId?: string | null };
 
 export type ClientMessage =
   | { type: 'create_room'; playerName: string }
@@ -65,3 +65,5 @@ export type ClientMessage =
   | { type: 'start_game' }
   | { type: 'claim_bingo'; cardIndex: number }
   | { type: 'leave_room' };
+
+
