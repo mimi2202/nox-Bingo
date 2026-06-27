@@ -1,4 +1,4 @@
-import { WebSocketServer, WebSocket } from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { ClientMessage } from './types';
 import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom } from './RoomManager';
@@ -29,7 +29,7 @@ wss.on('connection', (ws: WebSocket) => {
       switch (message.type) {
         case 'create_room': {
           playerNames.set(playerId, message.playerName);
-          const { room, messages } = createRoom(playerId, message.playerName);
+          const { room, messages } = createRoom(playerId, message.playerName, (message as any).prizeTier || 'standard');
           messages.forEach(msg => {
             if (msg.type === 'cards_dealt') {
               send(ws, msg);
@@ -129,4 +129,6 @@ wss.on('connection', (ws: WebSocket) => {
   });
 });
 console.log('NoxBingo server running on port ' + PORT);
+
+
 

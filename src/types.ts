@@ -35,6 +35,8 @@ export interface Player {
 }
 
 export interface Room {
+  bingoPrize: number;
+  noxPrize: number;
   code: string;
   hostId: string;
   players: Map<string, Player>;
@@ -60,10 +62,12 @@ export type ServerMessage =
   | { type: 'players_update'; players: { id: string; name: string }[]; hostId?: string | null };
 
 export type ClientMessage =
-  | { type: 'create_room'; playerName: string }
+  | { type: 'create_room'; playerName: string; prizeTier?: string }
   | { type: 'join_room'; roomCode: string; playerName: string }
   | { type: 'start_game' }
   | { type: 'claim_bingo'; cardIndex: number }
   | { type: 'leave_room' };
+
+
 
 

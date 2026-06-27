@@ -19,6 +19,13 @@ function getPlayerList(room: Room): { id: string; name: string }[] {
     name: p.name,
   }));
 }
+function getPrizes(tier: string): { bingo: number; nox: number } {
+  switch (tier) {
+    case 'casual': return { bingo: 50, nox: 10 };
+    case 'high': return { bingo: 500, nox: 100 };
+    default: return { bingo: 100, nox: 25 };
+  }
+}
 function clearRoomTimer(roomCode: string) {
   const timer = roomTimers.get(roomCode);
   if (timer) {
@@ -26,7 +33,7 @@ function clearRoomTimer(roomCode: string) {
     roomTimers.delete(roomCode);
   }
 }
-export function createRoom(playerId: string, playerName: string): { room: Room; messages: ServerMessage[] } {
+export function createRoom(playerId: string, playerName: string, prizeTier: string = 'standard'): { room: Room; messages: ServerMessage[] } {
   const code = generateRoomCode();
   const player: Player = {
     id: playerId,
@@ -36,7 +43,10 @@ export function createRoom(playerId: string, playerName: string): { room: Room; 
   };
   const players = new Map<string, Player>();
   players.set(playerId, player);
+  const prizes = getPrizes(prizeTier);
   const room: Room = {
+    bingoPrize: prizes.bingo,
+    noxPrize: prizes.nox,
     code,
     hostId: playerId,
     players,
@@ -49,7 +59,6 @@ export function createRoom(playerId: string, playerName: string): { room: Room; 
   };
   rooms.set(code, room);
   playerRooms.set(playerId, code);
-  // Set 3-minute expiry timer
   const timer = setTimeout(() => {
     const existingRoom = rooms.get(code);
     if (existingRoom && existingRoom.phase === 'waiting' && existingRoom.players.size <= 1) {
@@ -61,7 +70,7 @@ export function createRoom(playerId: string, playerName: string): { room: Room; 
   return {
     room,
     messages: [
-      { type: 'room_created', roomCode: code, playerId, hostId: playerId },
+      { type: 'room_created', roomCode: code, playerId, hostId: playerId, bingoPrize: room.bingoPrize, noxPrize: room.noxPrize },
       { type: 'players_update', players: getPlayerList(room), hostId: playerId },
     ],
   };
@@ -85,26 +94,11 @@ export function joinRoom(roomCode: string, playerId: string, playerName: string)
   };
   room.players.set(playerId, player);
   playerRooms.set(playerId, roomCode);
-  // Clear expiry timer since someone joined
   clearRoomTimer(roomCode);
   const messages: ServerMessage[] = [
-    {
-      type: 'player_joined',
-      playerId,
-      playerName,
-      playerCount: room.players.size,
-    },
-    {
-      type: 'players_update',
-      players: getPlayerList(room),
-      hostId: room.hostId,
-    },
-    {
-      type: 'room_created',
-      roomCode: room.code,
-      playerId,
-      hostId: room.hostId,
-    },
+    { type: 'player_joined', playerId, playerName, playerCount: room.players.size },
+    { type: 'players_update', players: getPlayerList(room), hostId: room.hostId },
+    { type: 'room_created', roomCode: room.code, playerId, hostId: room.hostId },
   ];
   return { room, messages };
 }
@@ -117,36 +111,19 @@ export function leaveRoom(playerId: string): { roomCode: string | null; messages
   const wasHost = room.hostId === playerId;
   room.players.delete(playerId);
   playerRooms.delete(playerId);
-  // If host leaves during an active game, end the game for everyone
   const gameEnded = wasHost && (room.phase === 'playing' || room.phase === 'countdown');
   const messages: ServerMessage[] = [
-    {
-      type: 'player_left',
-      playerId,
-      playerName: player?.name || 'Unknown',
-      playerCount: room.players.size,
-    },
-    {
-      type: 'players_update',
-      players: getPlayerList(room),
-      hostId: wasHost ? (room.players.size > 0 ? Array.from(room.players.keys())[0] : null) : room.hostId,
-    },
+    { type: 'player_left', playerId, playerName: player?.name || 'Unknown', playerCount: room.players.size },
+    { type: 'players_update', players: getPlayerList(room), hostId: wasHost ? (room.players.size > 0 ? Array.from(room.players.keys())[0] : null) : room.hostId },
   ];
-  // If host left during game, end it
   if (gameEnded) {
     room.phase = 'finished';
-    messages.push({
-      type: 'game_over',
-      winnerId: null,
-      winnerName: null,
-    });
+    messages.push({ type: 'game_over', winnerId: null, winnerName: null });
   }
-  // If room is empty, clean up
   if (room.players.size === 0) {
     rooms.delete(roomCode);
     clearRoomTimer(roomCode);
   } else if (wasHost) {
-    // Transfer host to the next player
     const newHostId = Array.from(room.players.keys())[0];
     room.hostId = newHostId;
   }
@@ -187,12 +164,7 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
   const ball = room.drawSequence[nextIndex];
   room.currentDrawIndex = nextIndex;
   const messages: ServerMessage[] = [
-    {
-      type: 'ball_drawn',
-      ball,
-      letter: getLetterForNumber(ball),
-      index: nextIndex,
-    },
+    { type: 'ball_drawn', ball, letter: getLetterForNumber(ball), index: nextIndex },
   ];
   let gameEnded = false;
   for (const [pid, player] of room.players.entries()) {
@@ -209,23 +181,21 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
         winnerName: player.name,
         cardIndex: winner,
       });
-      break; // Stop immediately
+      break;
     }
-    if (!room.bonusWinnerId) {
-      for (let i = 0; i < player.cards.length; i++) {
-        const card = player.cards[i];
-        if (card.noxCell && !card.noxHit) {
-          const noxCellValue = card.grid[card.noxCell.row][card.noxCell.col];
-          if (typeof noxCellValue.value === 'number' && noxCellValue.value === ball) {
-            card.noxHit = true;
-            room.bonusWinnerId = pid;
-            messages.push({
-              type: 'nox_bonus',
-              winnerId: pid,
-              winnerName: player.name,
-              cardIndex: i,
-            });
-          }
+    for (let i = 0; i < player.cards.length; i++) {
+      const card = player.cards[i];
+      if (card.noxCell && !card.noxHit) {
+        const noxCellValue = card.grid[card.noxCell.row][card.noxCell.col];
+        if (typeof noxCellValue.value === 'number' && noxCellValue.value === ball) {
+          card.noxHit = true;
+          if (!room.bonusWinnerId) room.bonusWinnerId = pid;
+          messages.push({
+            type: 'nox_bonus',
+            winnerId: pid,
+            winnerName: player.name,
+            cardIndex: i,
+          });
         }
       }
     }
