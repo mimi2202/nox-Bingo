@@ -6,7 +6,7 @@ import {
 } from '@solana/spl-token';
 import bs58 from 'bs58';
 
-const OREN_MINT = new PublicKey('6EqY4SZKesXPzVJD3BhdFszYqnossy6t1gU43GSBqkQs');
+const OREN_MINT = new PublicKey('FvR82vvRtXmWKJXW5MUGVFLcLoRebfq3BasiYYRTD2JE');
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
 const DECIMALS = 8;
 
