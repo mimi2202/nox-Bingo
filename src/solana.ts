@@ -93,10 +93,6 @@ export async function verifyEntryFeePayment(
   if (!tx) return { ok: false, reason: 'Transaction not found (not confirmed yet, or invalid signature).' };
   if (tx.meta?.err) return { ok: false, reason: 'Transaction failed on-chain.' };
 
-  const treasuryAta = (await getAssociatedTokenAddress(OREN_MINT, treasuryKeypair.publicKey)).toBase58();
-  const payerPubkey = new PublicKey(expectedPayerWallet);
-  const payerAta = (await getAssociatedTokenAddress(OREN_MINT, payerPubkey)).toBase58();
-
   const pre = tx.meta?.preTokenBalances || [];
   const post = tx.meta?.postTokenBalances || [];
 

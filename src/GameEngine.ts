@@ -34,7 +34,7 @@ function pickNoxCell(): { row: number; col: number } {
 // (1, 3, or 5 — see CARD_BUNDLES in RoomManager.ts) instead of always
 // being 3. Defaults to 3 only for any leftover solo-mode callers that
 // don't pass a count explicitly.
-export function generateCards(seed: string, cardCount: number = 3): BingoCard[] {
+export function generateCards(_seed: string, cardCount: number = 3): BingoCard[] {
   const cards: BingoCard[] = [];
   for (let i = 0; i < cardCount; i++) {
     const bCol = generateColumnNumbers(B_COL.min, B_COL.max);
@@ -72,7 +72,7 @@ export function generateCards(seed: string, cardCount: number = 3): BingoCard[] 
   return cards;
 }
 
-export function generateDrawSequence(seed: string): number[] {
+export function generateDrawSequence(_seed: string): number[] {
   const balls: number[] = [];
   for (let i = 1; i <= 75; i++) balls.push(i);
   return shuffle(balls);
