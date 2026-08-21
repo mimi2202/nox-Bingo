@@ -55,6 +55,9 @@ function getPlayerList(room: Room) {
     cardCount: p.cardCount,
   }));
 }
+function playersUpdateMessage(room: Room, hostId: string | null): ServerMessage {
+  return { type: 'players_update', players: getPlayerList(room), hostId, maxPlayers: room.maxPlayers };
+}
 function isReady(player: Player): boolean {
   return !!player.walletAddress && player.paidEntryFee;
 }
@@ -103,11 +106,7 @@ function removePlayerFromRoom(room: Room, playerId: string): ServerMessage[] | n
   const gameEnded = wasHost && (room.phase === 'playing' || room.phase === 'countdown');
   const messages: ServerMessage[] = [
     { type: 'player_left', playerId, playerName: player.name, playerCount: room.players.size },
-    {
-      type: 'players_update',
-      players: getPlayerList(room),
-      hostId: wasHost ? (room.players.size > 0 ? Array.from(room.players.keys())[0] : null) : room.hostId,
-    },
+    playersUpdateMessage(room, wasHost ? (room.players.size > 0 ? Array.from(room.players.keys())[0] : null) : room.hostId),
   ];
   if (gameEnded) {
     room.phase = 'finished';
@@ -125,9 +124,13 @@ function removePlayerFromRoom(room: Room, playerId: string): ServerMessage[] | n
 export function createRoom(
   playerId: string,
   playerName: string,
-  walletAddress: string | null = null
+  walletAddress: string | null = null,
+  maxPlayers: number = 6
 ): { room: Room; messages: ServerMessage[] } {
   const code = generateRoomCode();
+  // Clamp to a sane range server-side — never trust a client-supplied
+  // number directly, even for something this low-stakes.
+  const clampedMax = Math.max(1, Math.min(10, Math.floor(maxPlayers) || 6));
   const player: Player = {
     id: playerId,
     name: playerName,
@@ -144,6 +147,7 @@ export function createRoom(
   const room: Room = {
     code,
     hostId: playerId,
+    maxPlayers: clampedMax,
     players,
     drawSequence: [],
     currentDrawIndex: -1,
@@ -166,8 +170,8 @@ export function createRoom(
   return {
     room,
     messages: [
-      { type: 'room_created', roomCode: code, playerId, hostId: playerId },
-      { type: 'players_update', players: getPlayerList(room), hostId: playerId },
+      { type: 'room_created', roomCode: code, playerId, hostId: playerId, maxPlayers: clampedMax },
+      { type: 'players_update', players: getPlayerList(room), hostId: playerId, maxPlayers: clampedMax },
     ],
   };
 }
@@ -184,8 +188,8 @@ export function joinRoom(
   if (room.phase !== 'waiting') {
     return { room: null as any, messages: [{ type: 'error', message: 'Game already in progress' }] };
   }
-  if (room.players.size >= 10) {
-    return { room: null as any, messages: [{ type: 'error', message: 'Room is full (max 10 players)' }] };
+  if (room.players.size >= room.maxPlayers) {
+    return { room: null as any, messages: [{ type: 'error', message: `Room is full (max ${room.maxPlayers} players)` }] };
   }
   const player: Player = {
     id: playerId,
@@ -204,8 +208,8 @@ export function joinRoom(
   scheduleReadyTimeout(playerId, roomCode);
   const messages: ServerMessage[] = [
     { type: 'player_joined', playerId, playerName, playerCount: room.players.size },
-    { type: 'players_update', players: getPlayerList(room), hostId: room.hostId },
-    { type: 'room_created', roomCode: room.code, playerId, hostId: room.hostId },
+    playersUpdateMessage(room, room.hostId),
+    { type: 'room_created', roomCode: room.code, playerId, hostId: room.hostId, maxPlayers: room.maxPlayers },
   ];
   return { room, messages };
 }
@@ -217,7 +221,7 @@ export function setWallet(playerId: string, walletAddress: string): { room: Room
   if (!player) return { room: null, messages: [] };
   player.walletAddress = walletAddress;
   if (isReady(player)) clearReadyTimer(playerId);
-  return { room, messages: [{ type: 'players_update', players: getPlayerList(room), hostId: room.hostId }] };
+  return { room, messages: [playersUpdateMessage(room, room.hostId)] };
 }
 
 /**
@@ -248,7 +252,7 @@ export function markEntryFeePaid(
     room,
     messages: [
       { type: 'entry_fee_confirmed', playerId, cardCount: bundle.cardCount },
-      { type: 'players_update', players: getPlayerList(room), hostId: room.hostId },
+      playersUpdateMessage(room, room.hostId),
     ],
   };
 }

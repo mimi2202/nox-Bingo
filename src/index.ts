@@ -79,7 +79,8 @@ wss.on('connection', (ws: WebSocket) => {
           const { room, messages } = createRoom(
             playerId,
             message.playerName,
-            message.walletAddress || null
+            message.walletAddress || null,
+            message.maxPlayers
           );
           messages.forEach(msg => {
             if (msg.type === 'cards_dealt') {

@@ -49,6 +49,7 @@ export interface Player {
 export interface Room {
   code: string;
   hostId: string;
+  maxPlayers: number;
   players: Map<string, Player>;
   drawSequence: number[];
   currentDrawIndex: number;
@@ -59,7 +60,7 @@ export interface Room {
 }
 
 export type ServerMessage =
-  | { type: 'room_created'; roomCode: string; playerId: string; hostId?: string }
+  | { type: 'room_created'; roomCode: string; playerId: string; hostId?: string; maxPlayers?: number }
   | { type: 'player_joined'; playerId: string; playerName: string; playerCount: number }
   | { type: 'player_left'; playerId: string; playerName: string; playerCount: number }
   | { type: 'game_starting'; countdown: number }
@@ -86,10 +87,11 @@ export type ServerMessage =
         cardCount: number;
       }[];
       hostId?: string | null;
+      maxPlayers: number;
     };
 
 export type ClientMessage =
-  | { type: 'create_room'; playerName: string; walletAddress?: string }
+  | { type: 'create_room'; playerName: string; walletAddress?: string; maxPlayers?: number }
   | { type: 'join_room'; roomCode: string; playerName: string; walletAddress?: string }
   | { type: 'set_wallet'; walletAddress: string }
   | { type: 'submit_entry_fee'; txSignature: string; bundleId: string }
