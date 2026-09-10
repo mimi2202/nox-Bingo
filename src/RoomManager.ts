@@ -22,8 +22,21 @@ function getBundle(bundleId: string): CardBundle | undefined {
 
 // Flat off-chain cosmetic bonus display, unrelated to the on-chain pot.
 const NOX_BONUS_DISPLAY = 25;
-// House cut of the pot. The remaining 85% goes to the bingo winner.
+// House cut of the pot in multiplayer. The remaining 85% goes to the
+// bingo winner.
 export const RAKE_PERCENT = 0.15;
+
+// Solo play has no pot to split — a lone player's win pays out a
+// fixed multiplier of their own stake instead. Set below each
+// bundle's fair/break-even multiplier (roughly 1 / win-probability at
+// a 25-ball cap) so the house keeps a real statistical edge over
+// volume, while a win still pays out meaningfully more than the stake.
+export const SOLO_MULTIPLIERS: Record<string, number> = {
+  single: 15,
+  triple: 6,
+  five: 3.5,
+};
+const DEFAULT_SOLO_MULTIPLIER = 3.5;
 
 // A player has this long to both connect a wallet AND have a bundle
 // payment verified before being auto-removed from a still-waiting room.
@@ -125,12 +138,14 @@ export function createRoom(
   playerId: string,
   playerName: string,
   walletAddress: string | null = null,
-  maxPlayers: number = 6
+  maxPlayers: number = 6,
+  isSolo: boolean = false
 ): { room: Room; messages: ServerMessage[] } {
   const code = generateRoomCode();
   // Clamp to a sane range server-side — never trust a client-supplied
-  // number directly, even for something this low-stakes.
-  const clampedMax = Math.max(1, Math.min(10, Math.floor(maxPlayers) || 6));
+  // number directly, even for something this low-stakes. Solo rooms
+  // are always exactly 1 player, regardless of what was requested.
+  const clampedMax = isSolo ? 1 : Math.max(1, Math.min(10, Math.floor(maxPlayers) || 6));
   const player: Player = {
     id: playerId,
     name: playerName,
@@ -148,6 +163,7 @@ export function createRoom(
     code,
     hostId: playerId,
     maxPlayers: clampedMax,
+    isSolo,
     players,
     drawSequence: [],
     currentDrawIndex: -1,
@@ -379,7 +395,17 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
 // Pot = sum of every player's actual payment (bundles can differ per
 // player). Winner gets (1 - RAKE_PERCENT) of it; the rest simply
 // never leaves the treasury.
-export function getPayoutAmount(room: Room): number {
+// Multiplayer: pot = sum of every player's payment, winner gets
+// (1 - RAKE_PERCENT) of it, the rest never leaves the treasury.
+// Solo: no pot to split — payout is the winner's own stake times
+// their bundle's fixed multiplier (see SOLO_MULTIPLIERS above).
+export function getPayoutAmount(room: Room, winnerId: string): number {
+  if (room.isSolo) {
+    const winner = room.players.get(winnerId);
+    if (!winner) return 0;
+    const multiplier = (winner.bundleId && SOLO_MULTIPLIERS[winner.bundleId]) || DEFAULT_SOLO_MULTIPLIER;
+    return winner.amountPaidOren * multiplier;
+  }
   const pot = Array.from(room.players.values()).reduce((sum, p) => sum + p.amountPaidOren, 0);
   return pot * (1 - RAKE_PERCENT);
 }

@@ -50,6 +50,10 @@ export interface Room {
   code: string;
   hostId: string;
   maxPlayers: number;
+  // A solo room has exactly one player, connects a wallet and pays
+  // for a bundle same as multiplayer, but the payout on a win is a
+  // fixed multiplier of their own stake instead of a shared pot split.
+  isSolo: boolean;
   players: Map<string, Player>;
   drawSequence: number[];
   currentDrawIndex: number;
@@ -91,7 +95,7 @@ export type ServerMessage =
     };
 
 export type ClientMessage =
-  | { type: 'create_room'; playerName: string; walletAddress?: string; maxPlayers?: number }
+  | { type: 'create_room'; playerName: string; walletAddress?: string; maxPlayers?: number; isSolo?: boolean }
   | { type: 'join_room'; roomCode: string; playerName: string; walletAddress?: string }
   | { type: 'set_wallet'; walletAddress: string }
   | { type: 'submit_entry_fee'; txSignature: string; bundleId: string }

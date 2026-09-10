@@ -38,7 +38,7 @@ async function handleWinnerPayout(roomCode: string, winnerId: string) {
     return;
   }
 
-  const totalPrize = getPayoutAmount(currentRoom);
+  const totalPrize = getPayoutAmount(currentRoom, winnerId);
   try {
     const txSignature = await payWinner(winner.walletAddress, totalPrize);
     broadcastToRoom(roomCode, { type: 'payout_sent', winnerId, txSignature, amount: totalPrize });
@@ -80,7 +80,8 @@ wss.on('connection', (ws: WebSocket) => {
             playerId,
             message.playerName,
             message.walletAddress || null,
-            message.maxPlayers
+            message.maxPlayers,
+            message.isSolo
           );
           messages.forEach(msg => {
             if (msg.type === 'cards_dealt') {
