@@ -1,41 +1,12 @@
 import { EventEmitter } from 'events';
-import { Room, Player, ServerMessage } from './types';
+import { Room, Player, ServerMessage, CardBundle } from './types';
 import { generateCards, generateDrawSequence, checkForWin, autoDaub, getLetterForNumber } from './GameEngine';
+import { getConfig } from './gameConfig';
 
-// Real, confirmed pricing — not placeholders. Server is the source of
-// truth: a client can only ever claim a bundleId, never a price or
-// card count directly, and this table is what gets looked up.
-export interface CardBundle {
-  id: string;
-  cardCount: number;
-  priceOren: number;
-  label: string;
-}
-export const CARD_BUNDLES: CardBundle[] = [
-  { id: 'single', cardCount: 1, priceOren: 3, label: '1 Card' },
-  { id: 'triple', cardCount: 3, priceOren: 5, label: '3 Cards' },
-  { id: 'five', cardCount: 5, priceOren: 8, label: '5 Cards' },
-];
-function getBundle(bundleId: string): CardBundle | undefined {
-  return CARD_BUNDLES.find(b => b.id === bundleId);
+function getBundle(room: Room, bundleId: string): CardBundle | undefined {
+  return room.bundles.find(b => b.id === bundleId);
 }
 
-// Flat off-chain cosmetic bonus display, unrelated to the on-chain pot.
-const NOX_BONUS_DISPLAY = 25;
-// House cut of the pot in multiplayer. The remaining 85% goes to the
-// bingo winner.
-export const RAKE_PERCENT = 0.15;
-
-// Solo play has no pot to split — a lone player's win pays out a
-// fixed multiplier of their own stake instead. Set below each
-// bundle's fair/break-even multiplier (roughly 1 / win-probability at
-// a 25-ball cap) so the house keeps a real statistical edge over
-// volume, while a win still pays out meaningfully more than the stake.
-export const SOLO_MULTIPLIERS: Record<string, number> = {
-  single: 15,
-  triple: 6,
-  five: 3.5,
-};
 const DEFAULT_SOLO_MULTIPLIER = 3.5;
 
 // A player has this long to both connect a wallet AND have a bundle
@@ -159,11 +130,20 @@ export function createRoom(
   };
   const players = new Map<string, Player>();
   players.set(playerId, player);
+  // Snapshot the current config here, once — this room keeps these
+  // exact values for its whole life, even if an admin changes the
+  // global config later. Only rooms created afterward see the change.
+  const config = getConfig();
   const room: Room = {
     code,
     hostId: playerId,
     maxPlayers: clampedMax,
     isSolo,
+    ballCap: config.ballCap,
+    rakePercent: config.rakePercent,
+    bundles: config.bundles,
+    soloMultipliers: config.soloMultipliers,
+    noxBonusDisplay: config.noxBonusDisplay,
     players,
     drawSequence: [],
     currentDrawIndex: -1,
@@ -186,7 +166,7 @@ export function createRoom(
   return {
     room,
     messages: [
-      { type: 'room_created', roomCode: code, playerId, hostId: playerId, maxPlayers: clampedMax },
+      { type: 'room_created', roomCode: code, playerId, hostId: playerId, maxPlayers: clampedMax, noxBonusDisplay: room.noxBonusDisplay },
       { type: 'players_update', players: getPlayerList(room), hostId: playerId, maxPlayers: clampedMax },
     ],
   };
@@ -225,7 +205,7 @@ export function joinRoom(
   const messages: ServerMessage[] = [
     { type: 'player_joined', playerId, playerName, playerCount: room.players.size },
     playersUpdateMessage(room, room.hostId),
-    { type: 'room_created', roomCode: room.code, playerId, hostId: room.hostId, maxPlayers: room.maxPlayers },
+    { type: 'room_created', roomCode: room.code, playerId, hostId: room.hostId, maxPlayers: room.maxPlayers, noxBonusDisplay: room.noxBonusDisplay },
   ];
   return { room, messages };
 }
@@ -243,10 +223,10 @@ export function setWallet(playerId: string, walletAddress: string): { room: Room
 /**
  * Called only after index.ts has independently verified the tx
  * on-chain, for the exact price of `bundleId`, via solana.ts. The
- * cardCount and price are looked up server-side from CARD_BUNDLES —
- * never taken from the client, even though the client also sent a
- * bundleId (that string is just which bundle to look up, not proof
- * of anything on its own).
+ * cardCount and price are looked up server-side from this room's own
+ * bundle snapshot — never taken from the client, even though the
+ * client also sent a bundleId (that string is just which bundle to
+ * look up, not proof of anything on its own).
  */
 export function markEntryFeePaid(
   playerId: string,
@@ -256,7 +236,7 @@ export function markEntryFeePaid(
   if (!room) return { room: null, messages: [] };
   const player = room.players.get(playerId);
   if (!player) return { room: null, messages: [] };
-  const bundle = getBundle(bundleId);
+  const bundle = getBundle(room, bundleId);
   if (!bundle) return { room: null, messages: [{ type: 'entry_fee_rejected', message: 'Unknown bundle.' }] };
 
   player.paidEntryFee = true;
@@ -379,7 +359,7 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
       }
     }
   }
-  if (nextIndex >= 24 && !gameEnded) {
+  if (nextIndex >= room.ballCap - 1 && !gameEnded) {
     room.phase = 'finished';
     messages.push({ type: 'game_over', winnerId: null, winnerName: null });
   } else if (gameEnded) {
@@ -392,22 +372,19 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
   return { room, messages };
 }
 
-// Pot = sum of every player's actual payment (bundles can differ per
-// player). Winner gets (1 - RAKE_PERCENT) of it; the rest simply
-// never leaves the treasury.
 // Multiplayer: pot = sum of every player's payment, winner gets
-// (1 - RAKE_PERCENT) of it, the rest never leaves the treasury.
+// (1 - room.rakePercent) of it, the rest never leaves the treasury.
 // Solo: no pot to split — payout is the winner's own stake times
-// their bundle's fixed multiplier (see SOLO_MULTIPLIERS above).
+// their bundle's fixed multiplier (room.soloMultipliers).
 export function getPayoutAmount(room: Room, winnerId: string): number {
   if (room.isSolo) {
     const winner = room.players.get(winnerId);
     if (!winner) return 0;
-    const multiplier = (winner.bundleId && SOLO_MULTIPLIERS[winner.bundleId]) || DEFAULT_SOLO_MULTIPLIER;
+    const multiplier = (winner.bundleId && room.soloMultipliers[winner.bundleId]) || DEFAULT_SOLO_MULTIPLIER;
     return winner.amountPaidOren * multiplier;
   }
   const pot = Array.from(room.players.values()).reduce((sum, p) => sum + p.amountPaidOren, 0);
-  return pot * (1 - RAKE_PERCENT);
+  return pot * (1 - room.rakePercent);
 }
 
 export function getRoom(roomCode: string): Room | undefined {
@@ -417,4 +394,11 @@ export function getPlayerRoom(playerId: string): Room | undefined {
   const roomCode = playerRooms.get(playerId);
   if (!roomCode) return undefined;
   return rooms.get(roomCode);
+}
+
+// For the admin dashboard's live stats view.
+export function getRoomStats(): { activeRooms: number; activePlayers: number } {
+  let activePlayers = 0;
+  for (const room of rooms.values()) activePlayers += room.players.size;
+  return { activeRooms: rooms.size, activePlayers };
 }

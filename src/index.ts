@@ -1,11 +1,27 @@
+import http from 'http';
+import express from 'express';
+import cors from 'cors';
 import WebSocket, { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { ClientMessage } from './types';
-import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom, setWallet, markEntryFeePaid, removePlayer, roomEvents, getPayoutAmount, CARD_BUNDLES } from './RoomManager';
+import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom, setWallet, markEntryFeePaid, removePlayer, roomEvents, getPayoutAmount } from './RoomManager';
 import { TREASURY_PUBLIC_KEY, payWinner, verifyEntryFeePayment } from './solana';
+import { loadConfigFromDb } from './gameConfig';
+import { adminRouter } from './admin';
 
 const PORT = parseInt(process.env.PORT || '3001');
-const wss = new WebSocketServer({ port: PORT });
+
+// One shared HTTP server carries both the admin REST API (Express)
+// and the game WebSocket server, so Render only needs to expose a
+// single port for the whole backend.
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use('/admin', adminRouter);
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
 const connections = new Map<string, WebSocket>();
 const playerNames = new Map<string, string>();
 function send(ws: WebSocket, message: object) {
@@ -135,7 +151,12 @@ wss.on('connection', (ws: WebSocket) => {
             send(ws, { type: 'entry_fee_rejected', message: 'Connect a wallet before paying the entry fee' });
             return;
           }
-          const bundle = CARD_BUNDLES.find(b => b.id === message.bundleId);
+          // Verify against THIS room's own bundle snapshot, not the
+          // current global config — a room keeps whatever prices were
+          // in effect when it was created, even if an admin changes
+          // pricing afterward. Fixes a stale CARD_BUNDLES reference
+          // that no longer existed after config became admin-editable.
+          const bundle = room.bundles.find(b => b.id === message.bundleId);
           if (!bundle) {
             send(ws, { type: 'entry_fee_rejected', message: 'Unknown bundle selected.' });
             return;
@@ -239,5 +260,14 @@ wss.on('connection', (ws: WebSocket) => {
     console.log('Player disconnected: ' + playerId);
   });
 });
-console.log('NoxBingo server running on port ' + PORT);
-console.log('Treasury pubkey: ' + TREASURY_PUBLIC_KEY);
+
+// Load the admin-editable config before accepting any connections, so
+// the very first room created uses real settings, not defaults.
+loadConfigFromDb()
+  .catch(err => console.error('Failed to load game config, using defaults:', err))
+  .finally(() => {
+    server.listen(PORT, () => {
+      console.log('NoxBingo server running on port ' + PORT);
+      console.log('Treasury pubkey: ' + TREASURY_PUBLIC_KEY);
+    });
+  });

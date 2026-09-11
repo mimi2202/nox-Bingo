@@ -46,6 +46,24 @@ export interface Player {
   amountPaidOren: number;
 }
 
+export interface CardBundle {
+  id: string;
+  cardCount: number;
+  priceOren: number;
+  label: string;
+}
+
+// Everything the admin dashboard can edit. A room snapshots this at
+// creation time (see RoomManager.createRoom) — later admin changes
+// only affect rooms created after the change, never ones in progress.
+export interface GameConfig {
+  ballCap: number;
+  rakePercent: number;
+  bundles: CardBundle[];
+  soloMultipliers: Record<string, number>;
+  noxBonusDisplay: number;
+}
+
 export interface Room {
   code: string;
   hostId: string;
@@ -54,6 +72,12 @@ export interface Room {
   // for a bundle same as multiplayer, but the payout on a win is a
   // fixed multiplier of their own stake instead of a shared pot split.
   isSolo: boolean;
+  // Config snapshot, captured once at room creation — see GameConfig.
+  ballCap: number;
+  rakePercent: number;
+  bundles: CardBundle[];
+  soloMultipliers: Record<string, number>;
+  noxBonusDisplay: number;
   players: Map<string, Player>;
   drawSequence: number[];
   currentDrawIndex: number;
@@ -64,7 +88,7 @@ export interface Room {
 }
 
 export type ServerMessage =
-  | { type: 'room_created'; roomCode: string; playerId: string; hostId?: string; maxPlayers?: number }
+  | { type: 'room_created'; roomCode: string; playerId: string; hostId?: string; maxPlayers?: number; noxBonusDisplay?: number }
   | { type: 'player_joined'; playerId: string; playerName: string; playerCount: number }
   | { type: 'player_left'; playerId: string; playerName: string; playerCount: number }
   | { type: 'game_starting'; countdown: number }
