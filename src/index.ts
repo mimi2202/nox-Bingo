@@ -4,16 +4,13 @@ import cors from 'cors';
 import WebSocket, { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { ClientMessage } from './types';
-import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom, setWallet, markEntryFeePaid, removePlayer, roomEvents, getPayoutAmount } from './RoomManager';
-import { TREASURY_PUBLIC_KEY, payWinner, verifyEntryFeePayment } from './solana';
+import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom, setWallet, markEntryFeePaid, removePlayer, roomEvents, getPayoutAmount, orenEquivalent, usdtEquivalent } from './RoomManager';
+import { TREASURY_PUBLIC_KEY, payWinner, verifyEntryFeePayment, verifySolEntryFeePayment } from './solana';
+import { getSolUsdPrice } from './pyth';
 import { loadConfigFromDb } from './gameConfig';
 import { adminRouter } from './admin';
 
 const PORT = parseInt(process.env.PORT || '3001');
-
-// One shared HTTP server carries both the admin REST API (Express)
-// and the game WebSocket server, so Render only needs to expose a
-// single port for the whole backend.
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -154,28 +151,61 @@ wss.on('connection', (ws: WebSocket) => {
           // Verify against THIS room's own bundle snapshot, not the
           // current global config — a room keeps whatever prices were
           // in effect when it was created, even if an admin changes
-          // pricing afterward. Fixes a stale CARD_BUNDLES reference
-          // that no longer existed after config became admin-editable.
+          // pricing afterward.
           const bundle = room.bundles.find(b => b.id === message.bundleId);
           if (!bundle) {
             send(ws, { type: 'entry_fee_rejected', message: 'Unknown bundle selected.' });
             return;
           }
-          verifyEntryFeePayment(message.txSignature, player.walletAddress, bundle.priceOren)
-            .then(result => {
-              if (!result.ok) {
-                send(ws, { type: 'entry_fee_rejected', message: result.reason || 'Could not verify that payment on-chain.' });
-                return;
-              }
-              const { room: updatedRoom, messages } = markEntryFeePaid(playerId, bundle.id);
-              if (updatedRoom) {
-                messages.forEach(msg => broadcastToRoom(updatedRoom.code, msg));
-              }
-            })
-            .catch(err => {
-              console.error('verifyEntryFeePayment failed:', err);
-              send(ws, { type: 'entry_fee_rejected', message: 'Could not verify payment right now — try again in a moment.' });
-            });
+
+          const currency = message.currency === 'SOL' ? 'SOL' : 'OREN';
+
+          if (currency === 'OREN') {
+            const expectedOren = orenEquivalent(room, bundle);
+            verifyEntryFeePayment(message.txSignature, player.walletAddress, expectedOren)
+              .then(result => {
+                if (!result.ok) {
+                  send(ws, { type: 'entry_fee_rejected', message: result.reason || 'Could not verify that payment on-chain.' });
+                  return;
+                }
+                const { room: updatedRoom, messages } = markEntryFeePaid(playerId, bundle.id, 'OREN');
+                if (updatedRoom) {
+                  messages.forEach(msg => broadcastToRoom(updatedRoom.code, msg));
+                }
+              })
+              .catch(err => {
+                console.error('verifyEntryFeePayment failed:', err);
+                send(ws, { type: 'entry_fee_rejected', message: 'Could not verify payment right now — try again in a moment.' });
+              });
+          } else {
+            // SOL: the amount owed depends on a live price that can
+            // move slightly between when the player was quoted a
+            // figure and now, so re-fetch the live price at
+            // verification time and allow a small tolerance rather
+            // than demanding an exact match.
+            const expectedUsdt = usdtEquivalent(room, bundle);
+            getSolUsdPrice()
+              .then(solUsdPrice => {
+                const expectedSol = expectedUsdt / solUsdPrice;
+                const TOLERANCE = 0.02; // allow the payment to be up to 2% short, covers brief price drift
+                const expectedLamports = Math.round(expectedSol * (1 - TOLERANCE) * 1e9);
+                return verifySolEntryFeePayment(message.txSignature, player.walletAddress!, expectedLamports);
+              })
+              .then(result => {
+                if (!result.ok) {
+                  send(ws, { type: 'entry_fee_rejected', message: result.reason || 'Could not verify that payment on-chain.' });
+                  return;
+                }
+                const { room: updatedRoom, messages } = markEntryFeePaid(playerId, bundle.id, 'SOL');
+                if (updatedRoom) {
+                  messages.forEach(msg => broadcastToRoom(updatedRoom.code, msg));
+                }
+              })
+              .catch(err => {
+                console.error('verifySolEntryFeePayment failed:', err);
+                send(ws, { type: 'entry_fee_rejected', message: 'Could not verify payment right now — try again in a moment.' });
+              });
+          }
           break;
         }
         case 'remove_player': {

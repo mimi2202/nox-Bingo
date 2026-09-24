@@ -7,10 +7,16 @@ function getBundle(room: Room, bundleId: string): CardBundle | undefined {
   return room.bundles.find(b => b.id === bundleId);
 }
 
+export function orenEquivalent(room: Room, bundle: CardBundle): number {
+  return bundle.priceGBP / room.orenToGbpRate;
+}
+
+export function usdtEquivalent(room: Room, bundle: CardBundle): number {
+  return bundle.priceGBP * room.gbpToUsdtRate;
+}
+
 const DEFAULT_SOLO_MULTIPLIER = 3.5;
 
-// A player has this long to both connect a wallet AND have a bundle
-// payment verified before being auto-removed from a still-waiting room.
 const READY_TIMEOUT_MS = 90 * 1000;
 
 const rooms = new Map<string, Room>();
@@ -127,12 +133,11 @@ export function createRoom(
     bundleId: null,
     cardCount: 0,
     amountPaidOren: 0,
+    paymentCurrency: null,
   };
   const players = new Map<string, Player>();
   players.set(playerId, player);
-  // Snapshot the current config here, once — this room keeps these
-  // exact values for its whole life, even if an admin changes the
-  // global config later. Only rooms created afterward see the change.
+
   const config = getConfig();
   const room: Room = {
     code,
@@ -144,6 +149,8 @@ export function createRoom(
     bundles: config.bundles,
     soloMultipliers: config.soloMultipliers,
     noxBonusDisplay: config.noxBonusDisplay,
+    orenToGbpRate: config.orenToGbpRate,
+    gbpToUsdtRate: config.gbpToUsdtRate,
     players,
     drawSequence: [],
     currentDrawIndex: -1,
@@ -166,7 +173,7 @@ export function createRoom(
   return {
     room,
     messages: [
-      { type: 'room_created', roomCode: code, playerId, hostId: playerId, maxPlayers: clampedMax, noxBonusDisplay: room.noxBonusDisplay },
+      { type: 'room_created', roomCode: code, playerId, hostId: playerId, maxPlayers: clampedMax, noxBonusDisplay: room.noxBonusDisplay, orenToGbpRate: room.orenToGbpRate, gbpToUsdtRate: room.gbpToUsdtRate, bundles: room.bundles },
       { type: 'players_update', players: getPlayerList(room), hostId: playerId, maxPlayers: clampedMax },
     ],
   };
@@ -197,6 +204,7 @@ export function joinRoom(
     bundleId: null,
     cardCount: 0,
     amountPaidOren: 0,
+    paymentCurrency: null,
   };
   room.players.set(playerId, player);
   playerRooms.set(playerId, roomCode);
@@ -205,7 +213,7 @@ export function joinRoom(
   const messages: ServerMessage[] = [
     { type: 'player_joined', playerId, playerName, playerCount: room.players.size },
     playersUpdateMessage(room, room.hostId),
-    { type: 'room_created', roomCode: room.code, playerId, hostId: room.hostId, maxPlayers: room.maxPlayers, noxBonusDisplay: room.noxBonusDisplay },
+    { type: 'room_created', roomCode: room.code, playerId, hostId: room.hostId, maxPlayers: room.maxPlayers, noxBonusDisplay: room.noxBonusDisplay, orenToGbpRate: room.orenToGbpRate, gbpToUsdtRate: room.gbpToUsdtRate, bundles: room.bundles },
   ];
   return { room, messages };
 }
@@ -220,17 +228,10 @@ export function setWallet(playerId: string, walletAddress: string): { room: Room
   return { room, messages: [playersUpdateMessage(room, room.hostId)] };
 }
 
-/**
- * Called only after index.ts has independently verified the tx
- * on-chain, for the exact price of `bundleId`, via solana.ts. The
- * cardCount and price are looked up server-side from this room's own
- * bundle snapshot — never taken from the client, even though the
- * client also sent a bundleId (that string is just which bundle to
- * look up, not proof of anything on its own).
- */
 export function markEntryFeePaid(
   playerId: string,
-  bundleId: string
+  bundleId: string,
+  currency: 'OREN' | 'SOL'
 ): { room: Room | null; messages: ServerMessage[] } {
   const room = getPlayerRoom(playerId);
   if (!room) return { room: null, messages: [] };
@@ -242,7 +243,8 @@ export function markEntryFeePaid(
   player.paidEntryFee = true;
   player.bundleId = bundle.id;
   player.cardCount = bundle.cardCount;
-  player.amountPaidOren = bundle.priceOren;
+  player.amountPaidOren = orenEquivalent(room, bundle);
+  player.paymentCurrency = currency;
   if (isReady(player)) clearReadyTimer(playerId);
   return {
     room,
@@ -372,10 +374,6 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
   return { room, messages };
 }
 
-// Multiplayer: pot = sum of every player's payment, winner gets
-// (1 - room.rakePercent) of it, the rest never leaves the treasury.
-// Solo: no pot to split — payout is the winner's own stake times
-// their bundle's fixed multiplier (room.soloMultipliers).
 export function getPayoutAmount(room: Room, winnerId: string): number {
   if (room.isSolo) {
     const winner = room.players.get(winnerId);
