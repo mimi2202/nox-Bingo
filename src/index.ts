@@ -11,6 +11,10 @@ import { loadConfigFromDb } from './gameConfig';
 import { adminRouter } from './admin';
 
 const PORT = parseInt(process.env.PORT || '3001');
+
+// One shared HTTP server carries both the admin REST API (Express)
+// and the game WebSocket server, so Render only needs to expose a
+// single port for the whole backend.
 const app = express();
 app.use(cors());
 app.use(express.json());

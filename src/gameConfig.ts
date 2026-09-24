@@ -1,120 +1,171 @@
-// Card generation
-export function generateColumn(min: number, max: number, count: number): number[] {
-  const numbers: number[] = [];
-  for (let i = min; i <= max; i++) numbers.push(i);
-  return shuffle(numbers).slice(0, count);
+import { createClient } from '@supabase/supabase-js';
+import { GameConfig, CardBundle } from './types';
+
+const DEFAULT_CONFIG: GameConfig = {
+  ballCap: 25,
+  rakePercent: 0.15,
+  bundles: [
+    { id: 'single', cardCount: 1, priceGBP: 3.5, label: '1 Card' },
+    { id: 'triple', cardCount: 3, priceGBP: 9, label: '3 Cards' },
+    { id: 'five', cardCount: 5, priceGBP: 13, label: '5 Cards' },
+  ],
+  soloMultipliers: { single: 15, triple: 6, five: 3.5 },
+  noxBonusDisplay: 25,
+  orenToGbpRate: 1.5,
+  // Placeholder — set the real current GBP/USDT rate in the admin
+  // dashboard before relying on this for real SOL payments.
+  gbpToUsdtRate: 1.27,
+};
+
+function loadSupabase() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    throw new Error(
+      'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set for the admin config store. ' +
+        'Use the service role key (not the anon key) — the server needs to read/write ' +
+        'game_config directly, bypassing row-level security.'
+    );
+  }
+  return createClient(url, key);
 }
 
-export function shuffle<T>(array: T[]): T[] {
-  const result = [...array];
-  for (let i = result.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [result[i], result[j]] = [result[j], result[i]];
+const supabase = loadSupabase();
+
+// In-memory copy new rooms read from — updated immediately on a
+// successful admin save, and loaded fresh once at server startup.
+let currentConfig: GameConfig = DEFAULT_CONFIG;
+
+export function getConfig(): GameConfig {
+  return currentConfig;
+}
+
+export async function loadConfigFromDb(): Promise<void> {
+  const { data, error } = await supabase.from('game_config').select('data').eq('id', 1).single();
+
+  if (error || !data) {
+    console.warn('No game_config row found, seeding defaults:', error?.message);
+    await supabase.from('game_config').upsert({ id: 1, data: DEFAULT_CONFIG });
+    currentConfig = DEFAULT_CONFIG;
+    return;
+  }
+
+  currentConfig = { ...DEFAULT_CONFIG, ...(data.data as Partial<GameConfig>) };
+  console.log('Game config loaded:', JSON.stringify(currentConfig));
+}
+
+function validateBundles(bundles: unknown): CardBundle[] {
+  if (!Array.isArray(bundles) || bundles.length === 0) {
+    throw new Error('bundles must be a non-empty array');
+  }
+  return bundles.map((b, i) => {
+    if (typeof b.id !== 'string' || !b.id) throw new Error(`bundle[${i}].id must be a non-empty string`);
+    const cardCount = Math.round(Number(b.cardCount));
+    const priceGBP = Number(b.priceGBP);
+    if (!Number.isFinite(cardCount) || cardCount < 1 || cardCount > 20) {
+      throw new Error(`bundle[${i}].cardCount must be between 1 and 20`);
+    }
+    if (!Number.isFinite(priceGBP) || priceGBP <= 0 || priceGBP > 100000) {
+      throw new Error(`bundle[${i}].priceGBP must be a positive number`);
+    }
+    return {
+      id: b.id,
+      cardCount,
+      priceGBP,
+      label: typeof b.label === 'string' && b.label ? b.label : `${cardCount} Card${cardCount === 1 ? '' : 's'}`,
+    };
+  });
+}
+
+function validateSoloMultipliers(multipliers: unknown, bundles: CardBundle[]): Record<string, number> {
+  if (typeof multipliers !== 'object' || multipliers === null) {
+    throw new Error('soloMultipliers must be an object');
+  }
+  const result: Record<string, number> = {};
+  for (const bundle of bundles) {
+    const raw = (multipliers as Record<string, unknown>)[bundle.id];
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0 || value > 1000) {
+      throw new Error(`soloMultipliers.${bundle.id} must be a positive number`);
+    }
+    result[bundle.id] = value;
   }
   return result;
 }
 
-export interface BingoCell {
-  value: number | 'FREE';
-  marked: boolean;
-  isFreeSpace: boolean;
+/**
+ * Validates and persists a partial config update, then updates the
+ * in-memory copy immediately so it's visible right away — but only
+ * rooms created after this point ever see it (see Room's config
+ * snapshot fields in types.ts).
+ */
+export async function updateConfig(partial: Partial<GameConfig>): Promise<GameConfig> {
+  const next: GameConfig = { ...currentConfig };
+
+  if (partial.ballCap !== undefined) {
+    const ballCap = Math.round(Number(partial.ballCap));
+    if (!Number.isFinite(ballCap) || ballCap < 5 || ballCap > 75) {
+      throw new Error('ballCap must be between 5 and 75');
+    }
+    next.ballCap = ballCap;
+  }
+
+  if (partial.rakePercent !== undefined) {
+    const rakePercent = Number(partial.rakePercent);
+    if (!Number.isFinite(rakePercent) || rakePercent < 0 || rakePercent > 0.9) {
+      throw new Error('rakePercent must be between 0 and 0.9 (i.e. 0% to 90%)');
+    }
+    next.rakePercent = rakePercent;
+  }
+
+  if (partial.bundles !== undefined) {
+    next.bundles = validateBundles(partial.bundles);
+  }
+
+  if (partial.soloMultipliers !== undefined) {
+    next.soloMultipliers = validateSoloMultipliers(partial.soloMultipliers, next.bundles);
+  } else if (partial.bundles !== undefined) {
+    // Bundles changed but multipliers weren't explicitly sent — make
+    // sure every bundle still has a multiplier, defaulting new ones.
+    const merged: Record<string, number> = {};
+    for (const bundle of next.bundles) {
+      merged[bundle.id] = next.soloMultipliers[bundle.id] ?? 3.5;
+    }
+    next.soloMultipliers = merged;
+  }
+
+  if (partial.noxBonusDisplay !== undefined) {
+    const noxBonusDisplay = Number(partial.noxBonusDisplay);
+    if (!Number.isFinite(noxBonusDisplay) || noxBonusDisplay < 0 || noxBonusDisplay > 100000) {
+      throw new Error('noxBonusDisplay must be a non-negative number');
+    }
+    next.noxBonusDisplay = noxBonusDisplay;
+  }
+
+  if (partial.orenToGbpRate !== undefined) {
+    const orenToGbpRate = Number(partial.orenToGbpRate);
+    if (!Number.isFinite(orenToGbpRate) || orenToGbpRate <= 0 || orenToGbpRate > 100000) {
+      throw new Error('orenToGbpRate must be a positive number');
+    }
+    next.orenToGbpRate = orenToGbpRate;
+  }
+
+  if (partial.gbpToUsdtRate !== undefined) {
+    const gbpToUsdtRate = Number(partial.gbpToUsdtRate);
+    if (!Number.isFinite(gbpToUsdtRate) || gbpToUsdtRate <= 0 || gbpToUsdtRate > 1000) {
+      throw new Error('gbpToUsdtRate must be a positive number');
+    }
+    next.gbpToUsdtRate = gbpToUsdtRate;
+  }
+
+  const { error } = await supabase
+    .from('game_config')
+    .upsert({ id: 1, data: next, updated_at: new Date().toISOString() });
+
+  if (error) {
+    throw new Error('Failed to save config: ' + error.message);
+  }
+
+  currentConfig = next;
+  return currentConfig;
 }
-
-export interface BingoCard {
-  id: string;
-  grid: BingoCell[][];
-  noxCell: { row: number; col: number } | null;
-  noxHit: boolean;
-}
-
-export interface Player {
-  id: string;
-  name: string;
-  cards: BingoCard[];
-  connected: boolean;
-  walletAddress: string | null;
-  paidEntryFee: boolean;
-  bundleId: string | null;
-  cardCount: number;
-  amountPaidOren: number;
-  paymentCurrency: 'OREN' | 'SOL' | null;
-}
-
-export interface CardBundle {
-  id: string;
-  cardCount: number;
-  priceGBP: number;
-  label: string;
-}
-
-export interface GameConfig {
-  ballCap: number;
-  rakePercent: number;
-  bundles: CardBundle[];
-  soloMultipliers: Record<string, number>;
-  noxBonusDisplay: number;
-  orenToGbpRate: number;
-  gbpToUsdtRate: number;
-}
-
-export interface Room {
-  code: string;
-  hostId: string;
-  maxPlayers: number;
-  isSolo: boolean;
-  ballCap: number;
-  rakePercent: number;
-  bundles: CardBundle[];
-  soloMultipliers: Record<string, number>;
-  noxBonusDisplay: number;
-  orenToGbpRate: number;
-  gbpToUsdtRate: number;
-  players: Map<string, Player>;
-  drawSequence: number[];
-  currentDrawIndex: number;
-  phase: 'waiting' | 'countdown' | 'playing' | 'finished';
-  winningPlayerId: string | null;
-  bonusWinnerId: string | null;
-  createdAt: number;
-}
-
-export type ServerMessage =
-  | { type: 'room_created'; roomCode: string; playerId: string; hostId?: string; maxPlayers?: number; noxBonusDisplay?: number; orenToGbpRate?: number; gbpToUsdtRate?: number; bundles?: CardBundle[] }
-  | { type: 'player_joined'; playerId: string; playerName: string; playerCount: number }
-  | { type: 'player_left'; playerId: string; playerName: string; playerCount: number }
-  | { type: 'game_starting'; countdown: number }
-  | { type: 'cards_dealt'; cards: BingoCard[] }
-  | { type: 'ball_drawn'; ball: number; letter: string; index: number }
-  | { type: 'bingo'; winnerId: string; winnerName: string; cardIndex: number }
-  | { type: 'nox_bonus'; winnerId: string; winnerName: string; cardIndex: number }
-  | { type: 'game_over'; winnerId: string | null; winnerName: string | null }
-  // Sent once the server has actually sent OREN to the winner's wallet.
-  | { type: 'payout_sent'; winnerId: string; txSignature: string; amount: number }
-  | { type: 'payout_error'; message: string }
-  | { type: 'entry_fee_confirmed'; playerId: string; cardCount: number }
-  | { type: 'entry_fee_rejected'; message: string }
-  | { type: 'removed_from_room'; reason: 'wallet_timeout' | 'fee_timeout' | 'host_removed' }
-  | { type: 'error'; message: string }
-  | {
-      type: 'players_update';
-      players: {
-        id: string;
-        name: string;
-        walletAddress: string | null;
-        paidEntryFee: boolean;
-        bundleId: string | null;
-        cardCount: number;
-      }[];
-      hostId?: string | null;
-      maxPlayers: number;
-    };
-
-export type ClientMessage =
-  | { type: 'create_room'; playerName: string; walletAddress?: string; maxPlayers?: number; isSolo?: boolean }
-  | { type: 'join_room'; roomCode: string; playerName: string; walletAddress?: string }
-  | { type: 'set_wallet'; walletAddress: string }
-  | { type: 'submit_entry_fee'; txSignature: string; bundleId: string; currency: 'OREN' | 'SOL' }
-  | { type: 'remove_player'; playerId: string }
-  | { type: 'start_game' }
-  | { type: 'claim_bingo'; cardIndex: number }
-  | { type: 'leave_room' };

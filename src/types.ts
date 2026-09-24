@@ -43,13 +43,25 @@ export interface Player {
   // payment time — never trust a client-supplied cardCount directly.
   bundleId: string | null;
   cardCount: number;
+  // OREN-EQUIVALENT value of their stake, always computed from the
+  // bundle's GBP price divided by the room's OREN rate — the same
+  // number regardless of which currency they actually paid in. This
+  // is what makes multiplayer pot math and solo payout math work
+  // identically whether someone paid in OREN or in SOL.
   amountPaidOren: number;
+  // Which currency they actually signed a transaction in — for
+  // record-keeping only, doesn't affect payout math.
+  paymentCurrency: 'OREN' | 'SOL' | null;
 }
 
 export interface CardBundle {
   id: string;
   cardCount: number;
-  priceOren: number;
+  // The real price, in GBP. OREN's own value floats until it's
+  // actually circulating, so GBP — not a token amount — is the
+  // source of truth here. OREN and SOL prices are both derived from
+  // this at payment time.
+  priceGBP: number;
   label: string;
 }
 
@@ -62,6 +74,17 @@ export interface GameConfig {
   bundles: CardBundle[];
   soloMultipliers: Record<string, number>;
   noxBonusDisplay: number;
+  // How much one OREN is worth, in GBP. OREN payments convert
+  // directly through this rate. Admin-set because OREN has no real
+  // market price yet.
+  orenToGbpRate: number;
+  // How many USDT one GBP is worth. Used only as a bridge for SOL
+  // pricing — a bundle's GBP price times this gives its USDT price,
+  // which then divides by the live SOL/USD price (from Pyth) to get
+  // the actual SOL amount to charge. Fixed/admin-set rather than a
+  // second live feed, to keep this simple — update it manually if it
+  // drifts too far from the real rate.
+  gbpToUsdtRate: number;
 }
 
 export interface Room {
@@ -78,6 +101,8 @@ export interface Room {
   bundles: CardBundle[];
   soloMultipliers: Record<string, number>;
   noxBonusDisplay: number;
+  orenToGbpRate: number;
+  gbpToUsdtRate: number;
   players: Map<string, Player>;
   drawSequence: number[];
   currentDrawIndex: number;
@@ -88,7 +113,7 @@ export interface Room {
 }
 
 export type ServerMessage =
-  | { type: 'room_created'; roomCode: string; playerId: string; hostId?: string; maxPlayers?: number; noxBonusDisplay?: number }
+  | { type: 'room_created'; roomCode: string; playerId: string; hostId?: string; maxPlayers?: number; noxBonusDisplay?: number; orenToGbpRate?: number; gbpToUsdtRate?: number; bundles?: CardBundle[] }
   | { type: 'player_joined'; playerId: string; playerName: string; playerCount: number }
   | { type: 'player_left'; playerId: string; playerName: string; playerCount: number }
   | { type: 'game_starting'; countdown: number }
@@ -122,7 +147,10 @@ export type ClientMessage =
   | { type: 'create_room'; playerName: string; walletAddress?: string; maxPlayers?: number; isSolo?: boolean }
   | { type: 'join_room'; roomCode: string; playerName: string; walletAddress?: string }
   | { type: 'set_wallet'; walletAddress: string }
-  | { type: 'submit_entry_fee'; txSignature: string; bundleId: string }
+  // currency tells the server which verification path to use — OREN
+  // (SPL token transfer) or SOL (native transfer, converted through
+  // the live SOL/USD price at the moment of verification).
+  | { type: 'submit_entry_fee'; txSignature: string; bundleId: string; currency: 'OREN' | 'SOL' }
   | { type: 'remove_player'; playerId: string }
   | { type: 'start_game' }
   | { type: 'claim_bingo'; cardIndex: number }

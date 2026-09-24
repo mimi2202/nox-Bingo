@@ -7,16 +7,26 @@ function getBundle(room: Room, bundleId: string): CardBundle | undefined {
   return room.bundles.find(b => b.id === bundleId);
 }
 
+// The OREN-equivalent value of a bundle's stake, given this room's
+// snapshot rate. Used for BOTH currencies — an OREN payer's actual
+// OREN amount owed, and the figure recorded as "stake value" for a
+// SOL payer too, so pot/payout math never has to care which currency
+// someone actually paid in.
 export function orenEquivalent(room: Room, bundle: CardBundle): number {
   return bundle.priceGBP / room.orenToGbpRate;
 }
 
+// The USDT-equivalent value of a bundle's stake — the bridge currency
+// on the way to computing an actual SOL amount (divide this by the
+// live SOL/USD price from Pyth).
 export function usdtEquivalent(room: Room, bundle: CardBundle): number {
   return bundle.priceGBP * room.gbpToUsdtRate;
 }
 
 const DEFAULT_SOLO_MULTIPLIER = 3.5;
 
+// A player has this long to both connect a wallet AND have a bundle
+// payment verified before being auto-removed from a still-waiting room.
 const READY_TIMEOUT_MS = 90 * 1000;
 
 const rooms = new Map<string, Room>();
@@ -137,7 +147,7 @@ export function createRoom(
   };
   const players = new Map<string, Player>();
   players.set(playerId, player);
-
+  
   const config = getConfig();
   const room: Room = {
     code,
