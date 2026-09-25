@@ -50,7 +50,26 @@ export async function loadConfigFromDb(): Promise<void> {
     return;
   }
 
-  currentConfig = { ...DEFAULT_CONFIG, ...(data.data as Partial<GameConfig>) };
+  const stored = data.data as Partial<GameConfig>;
+  const merged: GameConfig = { ...DEFAULT_CONFIG, ...stored };
+
+  // A stored row from before a schema change (e.g. bundles.priceOren
+  // instead of bundles.priceGBP) can otherwise silently overwrite a
+  // perfectly good code default with stale data that merely happens
+  // to be shaped closely enough to not throw — exactly what happened
+  // when the GBP pricing migration shipped. Validate the bundles
+  // specifically before trusting them; fall back to the code default
+  // and re-persist it if they don't hold up, rather than serving
+  // broken config indefinitely until someone notices.
+  try {
+    merged.bundles = validateBundles(merged.bundles);
+  } catch (err) {
+    console.warn('Stored bundles failed validation, falling back to defaults:', err);
+    merged.bundles = DEFAULT_CONFIG.bundles;
+    await supabase.from('game_config').upsert({ id: 1, data: merged, updated_at: new Date().toISOString() });
+  }
+
+  currentConfig = merged;
   console.log('Game config loaded:', JSON.stringify(currentConfig));
 }
 
