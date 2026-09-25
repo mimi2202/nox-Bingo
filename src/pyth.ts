@@ -8,11 +8,22 @@ interface HermesPriceResponse {
   }[];
 }
 
-// Pyth prices come as an integer plus a power-of-ten exponent (e.g.
-// price=15234500000, expo=-8 means the real value is 152.345) rather
-// than a plain float, to avoid floating-point precision issues.
+function getPythApiKey(): string {
+  const key = process.env.PYTH_API_KEY;
+  if (!key) {
+    throw new Error(
+      'PYTH_API_KEY is not set. Pyth\'s August 2026 Core upgrade now requires an API key ' +
+        'for all Hermes requests — sign up at their developer portal for a free key and set ' +
+        'this env var, unauthenticated requests are rejected as of that upgrade.'
+    );
+  }
+  return key;
+}
+
 export async function getSolUsdPrice(): Promise<number> {
-  const res = await fetch(`${HERMES_URL}?ids[]=${SOL_USD_FEED_ID}`);
+  const res = await fetch(`${HERMES_URL}?ids[]=${SOL_USD_FEED_ID}`, {
+    headers: { Authorization: `Bearer ${getPythApiKey()}` },
+  });
   if (!res.ok) {
     throw new Error(`Pyth price fetch failed: ${res.status} ${res.statusText}`);
   }
