@@ -20,6 +20,21 @@ app.use(cors());
 app.use(express.json());
 app.use('/admin', adminRouter);
 
+// Public, unauthenticated — just a live price quote for display. The
+// client hits this instead of calling Pyth's Hermes API directly,
+// since that's a browser-side CORS problem, not a security one; the
+// actual payment verification already calls Pyth server-side
+// regardless of what this endpoint returns.
+app.get('/sol-price', async (_req, res) => {
+  try {
+    const price = await getSolUsdPrice();
+    res.json({ price });
+  } catch (err) {
+    console.error('GET /sol-price failed:', err);
+    res.status(502).json({ error: 'Could not fetch live SOL price right now.' });
+  }
+});
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
@@ -298,7 +313,7 @@ wss.on('connection', (ws: WebSocket) => {
 // Load the admin-editable config before accepting any connections, so
 // the very first room created uses real settings, not defaults.
 loadConfigFromDb()
-  .catch(err => console.error('Failed to load game config, using defaults:', err))
+  .catch((err: unknown) => console.error('Failed to load game config, using defaults:', err))
   .finally(() => {
     server.listen(PORT, () => {
       console.log('NoxBingo server running on port ' + PORT);
