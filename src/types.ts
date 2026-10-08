@@ -85,6 +85,20 @@ export interface GameConfig {
   // second live feed, to keep this simple — update it manually if it
   // drifts too far from the real rate.
   gbpToUsdtRate: number;
+  // Whether the jackpot feature is active at all. A kill switch the
+  // admin can flip off instantly without touching odds or amount.
+  jackpotEnabled: boolean;
+  // Fixed OREN amount paid out on top of a winner's normal payout
+  // when the jackpot hits. This is a flat treasury allocation — it
+  // does NOT grow from the rake, and does NOT reset after a win. The
+  // admin tops it up or changes it manually whenever they like.
+  jackpotAmountOren: number;
+  // The jackpot is a 1-in-N chance, rolled once per completed game
+  // that actually has a bingo winner (not on every ball, not on
+  // games that time out with no winner). Deliberately NOT sent to
+  // the client — only the jackpot amount is shown to players, never
+  // the odds, so the number stays a hook rather than a known-bad bet.
+  jackpotOddsOneIn: number;
 }
 
 export interface Room {
@@ -103,6 +117,9 @@ export interface Room {
   noxBonusDisplay: number;
   orenToGbpRate: number;
   gbpToUsdtRate: number;
+  jackpotEnabled: boolean;
+  jackpotAmountOren: number;
+  jackpotOddsOneIn: number;
   players: Map<string, Player>;
   drawSequence: number[];
   currentDrawIndex: number;
@@ -113,7 +130,21 @@ export interface Room {
 }
 
 export type ServerMessage =
-  | { type: 'room_created'; roomCode: string; playerId: string; hostId?: string; maxPlayers?: number; noxBonusDisplay?: number; orenToGbpRate?: number; gbpToUsdtRate?: number; bundles?: CardBundle[] }
+  | {
+      type: 'room_created';
+      roomCode: string;
+      playerId: string;
+      hostId?: string;
+      maxPlayers?: number;
+      noxBonusDisplay?: number;
+      orenToGbpRate?: number;
+      gbpToUsdtRate?: number;
+      bundles?: CardBundle[];
+      // Shown to players as a hook ("Jackpot: 5,000 OREN!") — odds are
+      // deliberately never sent to the client.
+      jackpotEnabled?: boolean;
+      jackpotAmountOren?: number;
+    }
   | { type: 'player_joined'; playerId: string; playerName: string; playerCount: number }
   | { type: 'player_left'; playerId: string; playerName: string; playerCount: number }
   | { type: 'game_starting'; countdown: number }
@@ -125,6 +156,14 @@ export type ServerMessage =
   // Sent once the server has actually sent OREN to the winner's wallet.
   | { type: 'payout_sent'; winnerId: string; txSignature: string; amount: number }
   | { type: 'payout_error'; message: string }
+  // Rolled server-side the moment a bingo winner is determined (see
+  // RoomManager.drawBall). Sent alongside 'bingo' as a heads-up to all
+  // clients that this game hit the jackpot — the actual OREN transfer
+  // and its confirmation arrives separately as 'jackpot_paid' once the
+  // on-chain transfer lands, same pattern as payout_sent.
+  | { type: 'jackpot_won'; winnerId: string; winnerName: string; amount: number }
+  | { type: 'jackpot_paid'; winnerId: string; txSignature: string; amount: number }
+  | { type: 'jackpot_payout_error'; message: string }
   | { type: 'entry_fee_confirmed'; playerId: string; cardCount: number }
   | { type: 'entry_fee_rejected'; message: string }
   | { type: 'removed_from_room'; reason: 'wallet_timeout' | 'fee_timeout' | 'host_removed' }

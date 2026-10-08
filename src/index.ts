@@ -5,7 +5,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { ClientMessage } from './types';
 import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom, setWallet, markEntryFeePaid, removePlayer, roomEvents, getPayoutAmount, orenEquivalent, usdtEquivalent } from './RoomManager';
-import { TREASURY_PUBLIC_KEY, payWinner, verifyEntryFeePayment, verifySolEntryFeePayment } from './solana';
+import { TREASURY_PUBLIC_KEY, payWinner, payJackpot, verifyEntryFeePayment, verifySolEntryFeePayment } from './solana';
 import { getSolUsdPrice } from './pyth';
 import { loadConfigFromDb } from './gameConfig';
 import { adminRouter } from './admin';
@@ -79,6 +79,37 @@ async function handleWinnerPayout(roomCode: string, winnerId: string) {
     broadcastToRoom(roomCode, {
       type: 'payout_error',
       message: 'Payout failed. Support may need to send the prize manually.',
+    });
+  }
+}
+
+// Fires after a 'jackpot_won' message — completely separate transfer
+// from the normal prize, sent in addition to it, never instead of it.
+// Looks up the winner by room+winnerId the same way handleWinnerPayout
+// does, since the room may have already been torn down by the time
+// this async call resolves if something else emptied it.
+async function handleJackpotPayout(roomCode: string, winnerId: string, amount: number) {
+  const room = getPlayerRoom(winnerId);
+  const currentRoom = room && room.code === roomCode ? room : undefined;
+  if (!currentRoom) return;
+
+  const winner = currentRoom.players.get(winnerId);
+  if (!winner?.walletAddress) {
+    broadcastToRoom(roomCode, {
+      type: 'jackpot_payout_error',
+      message: 'Jackpot winner has no connected wallet — jackpot could not be sent.',
+    });
+    return;
+  }
+
+  try {
+    const txSignature = await payJackpot(winner.walletAddress, amount);
+    broadcastToRoom(roomCode, { type: 'jackpot_paid', winnerId, txSignature, amount });
+  } catch (err) {
+    console.error('payJackpot failed:', err);
+    broadcastToRoom(roomCode, {
+      type: 'jackpot_payout_error',
+      message: 'Jackpot payout failed. Support may need to send it manually.',
     });
   }
 }
@@ -273,6 +304,13 @@ wss.on('connection', (ws: WebSocket) => {
                 broadcastToRoom(startedRoom.code, msg);
                 if (msg.type === 'bingo') {
                   handleWinnerPayout(startedRoom.code, msg.winnerId);
+                }
+                // jackpot_won is pushed right alongside 'bingo' by
+                // drawBall when the slim random chance hits — this is
+                // a SEPARATE transfer from the normal prize above,
+                // never a replacement for it.
+                if (msg.type === 'jackpot_won') {
+                  handleJackpotPayout(startedRoom.code, msg.winnerId, msg.amount);
                 }
               });
               if (result.room.phase === 'finished') {

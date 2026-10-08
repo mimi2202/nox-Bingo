@@ -33,20 +33,22 @@ const treasuryKeypair = loadTreasuryKeypair();
 export const TREASURY_PUBLIC_KEY = treasuryKeypair.publicKey.toBase58();
 
 /**
- * Sends OREN from the treasury wallet directly to a winner's wallet.
- * Creates the winner's associated token account first if needed.
+ * Shared transfer logic behind both payWinner and payJackpot — same
+ * treasury-to-wallet OREN transfer either way, just called from two
+ * different places in the payout flow and logged distinctly so the
+ * two kinds of payout stay tellable apart in server logs/history.
  */
-export async function payWinner(winnerWalletAddress: string, amountUiTokens: number): Promise<string> {
-  const winnerPubkey = new PublicKey(winnerWalletAddress);
+async function sendOrenTransfer(recipientWalletAddress: string, amountUiTokens: number): Promise<string> {
+  const recipientPubkey = new PublicKey(recipientWalletAddress);
   const treasuryAta = await getAssociatedTokenAddress(OREN_MINT, treasuryKeypair.publicKey);
-  const winnerAta = await getAssociatedTokenAddress(OREN_MINT, winnerPubkey);
+  const recipientAta = await getAssociatedTokenAddress(OREN_MINT, recipientPubkey);
 
   const tx = new Transaction();
 
-  const winnerAtaInfo = await connection.getAccountInfo(winnerAta);
-  if (!winnerAtaInfo) {
+  const recipientAtaInfo = await connection.getAccountInfo(recipientAta);
+  if (!recipientAtaInfo) {
     tx.add(
-      createAssociatedTokenAccountInstruction(treasuryKeypair.publicKey, winnerAta, winnerPubkey, OREN_MINT)
+      createAssociatedTokenAccountInstruction(treasuryKeypair.publicKey, recipientAta, recipientPubkey, OREN_MINT)
     );
   }
 
@@ -55,7 +57,7 @@ export async function payWinner(winnerWalletAddress: string, amountUiTokens: num
     createTransferCheckedInstruction(
       treasuryAta,
       OREN_MINT,
-      winnerAta,
+      recipientAta,
       treasuryKeypair.publicKey,
       rawAmount,
       DECIMALS
@@ -63,6 +65,30 @@ export async function payWinner(winnerWalletAddress: string, amountUiTokens: num
   );
 
   return sendAndConfirmTransaction(connection, tx, [treasuryKeypair], { commitment: 'confirmed' });
+}
+
+/**
+ * Sends OREN from the treasury wallet directly to a winner's wallet.
+ * Creates the winner's associated token account first if needed.
+ */
+export async function payWinner(winnerWalletAddress: string, amountUiTokens: number): Promise<string> {
+  const sig = await sendOrenTransfer(winnerWalletAddress, amountUiTokens);
+  console.log(`[payout] Sent ${amountUiTokens} OREN to ${winnerWalletAddress} — ${sig}`);
+  return sig;
+}
+
+/**
+ * Sends the fixed jackpot amount from the treasury to a winner's
+ * wallet. This is a SEPARATE transaction from the normal payWinner
+ * payout for the same game — the game winner always gets their normal
+ * payout first; this is purely additive on top when the jackpot hits.
+ * Call this only after RoomManager.drawBall has returned a
+ * 'jackpot_won' message for this game.
+ */
+export async function payJackpot(winnerWalletAddress: string, amountUiTokens: number): Promise<string> {
+  const sig = await sendOrenTransfer(winnerWalletAddress, amountUiTokens);
+  console.log(`[JACKPOT] Sent ${amountUiTokens} OREN to ${winnerWalletAddress} — ${sig}`);
+  return sig;
 }
 
 /**

@@ -15,6 +15,14 @@ const DEFAULT_CONFIG: GameConfig = {
   // Placeholder — set the real current GBP/USDT rate in the admin
   // dashboard before relying on this for real SOL payments.
   gbpToUsdtRate: 1.27,
+  // Jackpot defaults — deliberately conservative starting values.
+  // Admin should tune jackpotAmountOren and jackpotOddsOneIn from the
+  // dashboard once live; these are just safe placeholders so the
+  // feature doesn't accidentally pay out an unreasonable sum if
+  // someone forgets to configure it before enabling.
+  jackpotEnabled: false,
+  jackpotAmountOren: 5000,
+  jackpotOddsOneIn: 500,
 };
 
 function loadSupabase() {
@@ -69,6 +77,24 @@ export async function loadConfigFromDb(): Promise<void> {
     await supabase.from('game_config').upsert({ id: 1, data: merged, updated_at: new Date().toISOString() });
   }
 
+  // Same self-healing treatment for the jackpot fields — a row saved
+  // before this feature existed won't have them at all (handled fine
+  // by the DEFAULT_CONFIG spread above), but a corrupted or
+  // out-of-range stored value should fall back rather than silently
+  // let something like a negative jackpot amount or a 1-in-0 odds
+  // value through.
+  try {
+    merged.jackpotAmountOren = validateJackpotAmount(merged.jackpotAmountOren);
+    merged.jackpotOddsOneIn = validateJackpotOdds(merged.jackpotOddsOneIn);
+    merged.jackpotEnabled = Boolean(merged.jackpotEnabled);
+  } catch (err) {
+    console.warn('Stored jackpot config failed validation, falling back to defaults:', err);
+    merged.jackpotEnabled = DEFAULT_CONFIG.jackpotEnabled;
+    merged.jackpotAmountOren = DEFAULT_CONFIG.jackpotAmountOren;
+    merged.jackpotOddsOneIn = DEFAULT_CONFIG.jackpotOddsOneIn;
+    await supabase.from('game_config').upsert({ id: 1, data: merged, updated_at: new Date().toISOString() });
+  }
+
   currentConfig = merged;
   console.log('Game config loaded:', JSON.stringify(currentConfig));
 }
@@ -110,6 +136,22 @@ function validateSoloMultipliers(multipliers: unknown, bundles: CardBundle[]): R
     result[bundle.id] = value;
   }
   return result;
+}
+
+function validateJackpotAmount(amount: unknown): number {
+  const value = Number(amount);
+  if (!Number.isFinite(value) || value < 0 || value > 10_000_000) {
+    throw new Error('jackpotAmountOren must be between 0 and 10,000,000');
+  }
+  return value;
+}
+
+function validateJackpotOdds(odds: unknown): number {
+  const value = Math.round(Number(odds));
+  if (!Number.isFinite(value) || value < 2 || value > 1_000_000) {
+    throw new Error('jackpotOddsOneIn must be between 2 and 1,000,000');
+  }
+  return value;
 }
 
 /**
@@ -175,6 +217,18 @@ export async function updateConfig(partial: Partial<GameConfig>): Promise<GameCo
       throw new Error('gbpToUsdtRate must be a positive number');
     }
     next.gbpToUsdtRate = gbpToUsdtRate;
+  }
+
+  if (partial.jackpotEnabled !== undefined) {
+    next.jackpotEnabled = Boolean(partial.jackpotEnabled);
+  }
+
+  if (partial.jackpotAmountOren !== undefined) {
+    next.jackpotAmountOren = validateJackpotAmount(partial.jackpotAmountOren);
+  }
+
+  if (partial.jackpotOddsOneIn !== undefined) {
+    next.jackpotOddsOneIn = validateJackpotOdds(partial.jackpotOddsOneIn);
   }
 
   const { error } = await supabase

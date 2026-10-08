@@ -147,7 +147,7 @@ export function createRoom(
   };
   const players = new Map<string, Player>();
   players.set(playerId, player);
-  
+
   const config = getConfig();
   const room: Room = {
     code,
@@ -161,6 +161,9 @@ export function createRoom(
     noxBonusDisplay: config.noxBonusDisplay,
     orenToGbpRate: config.orenToGbpRate,
     gbpToUsdtRate: config.gbpToUsdtRate,
+    jackpotEnabled: config.jackpotEnabled,
+    jackpotAmountOren: config.jackpotAmountOren,
+    jackpotOddsOneIn: config.jackpotOddsOneIn,
     players,
     drawSequence: [],
     currentDrawIndex: -1,
@@ -183,7 +186,19 @@ export function createRoom(
   return {
     room,
     messages: [
-      { type: 'room_created', roomCode: code, playerId, hostId: playerId, maxPlayers: clampedMax, noxBonusDisplay: room.noxBonusDisplay, orenToGbpRate: room.orenToGbpRate, gbpToUsdtRate: room.gbpToUsdtRate, bundles: room.bundles },
+      {
+        type: 'room_created',
+        roomCode: code,
+        playerId,
+        hostId: playerId,
+        maxPlayers: clampedMax,
+        noxBonusDisplay: room.noxBonusDisplay,
+        orenToGbpRate: room.orenToGbpRate,
+        gbpToUsdtRate: room.gbpToUsdtRate,
+        bundles: room.bundles,
+        jackpotEnabled: room.jackpotEnabled,
+        jackpotAmountOren: room.jackpotAmountOren,
+      },
       { type: 'players_update', players: getPlayerList(room), hostId: playerId, maxPlayers: clampedMax },
     ],
   };
@@ -223,7 +238,19 @@ export function joinRoom(
   const messages: ServerMessage[] = [
     { type: 'player_joined', playerId, playerName, playerCount: room.players.size },
     playersUpdateMessage(room, room.hostId),
-    { type: 'room_created', roomCode: room.code, playerId, hostId: room.hostId, maxPlayers: room.maxPlayers, noxBonusDisplay: room.noxBonusDisplay, orenToGbpRate: room.orenToGbpRate, gbpToUsdtRate: room.gbpToUsdtRate, bundles: room.bundles },
+    {
+      type: 'room_created',
+      roomCode: room.code,
+      playerId,
+      hostId: room.hostId,
+      maxPlayers: room.maxPlayers,
+      noxBonusDisplay: room.noxBonusDisplay,
+      orenToGbpRate: room.orenToGbpRate,
+      gbpToUsdtRate: room.gbpToUsdtRate,
+      bundles: room.bundles,
+      jackpotEnabled: room.jackpotEnabled,
+      jackpotAmountOren: room.jackpotAmountOren,
+    },
   ];
   return { room, messages };
 }
@@ -352,6 +379,22 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
         winnerName: player.name,
         cardIndex: winner,
       });
+
+      // Jackpot is rolled exactly once per completed game, and only
+      // when that game actually produced a bingo winner — never on a
+      // game that times out with nobody winning. This message is just
+      // the announcement; index.ts is responsible for calling
+      // solana.payJackpot() and broadcasting 'jackpot_paid' once the
+      // on-chain transfer actually confirms, same as it already does
+      // for the normal payout via payWinner/payout_sent.
+      if (room.jackpotEnabled && Math.random() < 1 / room.jackpotOddsOneIn) {
+        messages.push({
+          type: 'jackpot_won',
+          winnerId: pid,
+          winnerName: player.name,
+          amount: room.jackpotAmountOren,
+        });
+      }
       break;
     }
     for (let i = 0; i < player.cards.length; i++) {
