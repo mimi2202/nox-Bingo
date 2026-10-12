@@ -1,3 +1,4 @@
+import { randomInt } from 'crypto';
 import { BingoCard, BingoCell } from './types';
 
 const B_COL = { min: 1, max: 15 };
@@ -6,10 +7,14 @@ const N_COL = { min: 31, max: 45 };
 const G_COL = { min: 46, max: 60 };
 const O_COL = { min: 61, max: 75 };
 
+// Fisher-Yates using a cryptographically secure RNG. Math.random() is
+// NOT secure — its internal state can be reconstructed from a modest
+// number of observed outputs (a player's own cards are exactly that),
+// which would let someone work out the draw order in advance.
 function shuffle<T>(array: T[]): T[] {
   const result = [...array];
   for (let i = result.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = randomInt(i + 1);
     [result[i], result[j]] = [result[j], result[i]];
   }
   return result;
@@ -24,8 +29,8 @@ function generateColumnNumbers(min: number, max: number): number[] {
 function pickNoxCell(): { row: number; col: number } {
   let row: number, col: number;
   do {
-    row = Math.floor(Math.random() * 5);
-    col = Math.floor(Math.random() * 5);
+    row = randomInt(5);
+    col = randomInt(5);
   } while (row === 2 && col === 2);
   return { row, col };
 }

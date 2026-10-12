@@ -120,6 +120,9 @@ export interface Room {
   jackpotEnabled: boolean;
   jackpotAmountOren: number;
   jackpotOddsOneIn: number;
+  // Total stakes paid in, fixed at the moment the game starts so players
+  // who drop out mid-game don't shrink the pot.
+  potOren?: number;
   players: Map<string, Player>;
   drawSequence: number[];
   currentDrawIndex: number;
@@ -168,6 +171,7 @@ export type ServerMessage =
   | { type: 'entry_fee_rejected'; message: string }
   | { type: 'removed_from_room'; reason: 'wallet_timeout' | 'fee_timeout' | 'host_removed' }
   | { type: 'error'; message: string }
+  | { type: 'wallet_challenge'; message: string }
   | {
       type: 'players_update';
       players: {
@@ -185,7 +189,7 @@ export type ServerMessage =
 export type ClientMessage =
   | { type: 'create_room'; playerName: string; walletAddress?: string; maxPlayers?: number; isSolo?: boolean }
   | { type: 'join_room'; roomCode: string; playerName: string; walletAddress?: string }
-  | { type: 'set_wallet'; walletAddress: string }
+  | { type: 'set_wallet'; walletAddress: string; walletSignature?: string }
   // currency tells the server which verification path to use — OREN
   // (SPL token transfer) or SOL (native transfer, converted through
   // the live SOL/USD price at the moment of verification).

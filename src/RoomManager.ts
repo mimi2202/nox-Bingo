@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { randomBytes, randomInt } from 'crypto';
 import { Room, Player, ServerMessage, CardBundle } from './types';
 import { generateCards, generateDrawSequence, checkForWin, autoDaub, getLetterForNumber } from './GameEngine';
 import { getConfig } from './gameConfig';
@@ -34,13 +35,29 @@ const playerRooms = new Map<string, string>();
 const roomTimers = new Map<string, NodeJS.Timeout>();
 const readyTimers = new Map<string, NodeJS.Timeout>();
 
+// Free practice games: a solo room created by someone who is NOT signed
+// in. No wallet, no payment, no prizes, no jackpot, no leaderboard stats.
+// Decided by the server (never by a client flag), so a guest can never
+// turn a free game into a paid prize.
+const practiceRooms = new Set<string>();
+export function isPracticeRoom(roomCode: string): boolean {
+  return practiceRooms.has(roomCode);
+}
+export function markPracticeRoom(room: Room): void {
+  if (!room.isSolo) return;
+  practiceRooms.add(room.code);
+  room.jackpotEnabled = false;
+  room.jackpotAmountOren = 0;
+  room.players.forEach((_p, pid) => clearReadyTimer(pid));
+}
+
 export const roomEvents = new EventEmitter();
 
 function generateRoomCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
   for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
+    code += chars[randomInt(chars.length)];
   }
   if (rooms.has(code)) return generateRoomCode();
   return code;
@@ -58,7 +75,8 @@ function getPlayerList(room: Room) {
 function playersUpdateMessage(room: Room, hostId: string | null): ServerMessage {
   return { type: 'players_update', players: getPlayerList(room), hostId, maxPlayers: room.maxPlayers };
 }
-function isReady(player: Player): boolean {
+function isReady(player: Player, room?: Room): boolean {
+  if (room && practiceRooms.has(room.code)) return true;
   return !!player.walletAddress && player.paidEntryFee;
 }
 
@@ -85,7 +103,7 @@ function scheduleReadyTimeout(playerId: string, roomCode: string) {
     const room = rooms.get(roomCode);
     if (!room) return;
     const player = room.players.get(playerId);
-    if (!player || isReady(player) || room.phase !== 'waiting') return;
+    if (!player || isReady(player, room) || room.phase !== 'waiting') return;
     const reason = !player.walletAddress ? 'wallet_timeout' : 'fee_timeout';
     const messages = removePlayerFromRoom(room, playerId);
     if (messages) {
@@ -103,15 +121,19 @@ function removePlayerFromRoom(room: Room, playerId: string): ServerMessage[] | n
   playerRooms.delete(playerId);
   clearReadyTimer(playerId);
 
-  const gameEnded = wasHost && (room.phase === 'playing' || room.phase === 'countdown');
+  // A paid seat that disappears before the game starts: the stake is
+  // already on-chain and the entry signature is burned, so leave a record
+  // that a refund may be due.
+  if (player.paidEntryFee && room.phase === 'waiting' && !practiceRooms.has(room.code)) {
+    console.warn('[refund] paid seat removed before start. room=' + room.code + ' wallet=' + player.walletAddress + ' amountOren=' + player.amountPaidOren);
+  }
+
   const messages: ServerMessage[] = [
     { type: 'player_left', playerId, playerName: player.name, playerCount: room.players.size },
     playersUpdateMessage(room, wasHost ? (room.players.size > 0 ? Array.from(room.players.keys())[0] : null) : room.hostId),
   ];
-  if (gameEnded) {
-    room.phase = 'finished';
-    messages.push({ type: 'game_over', winnerId: null, winnerName: null });
-  }
+  // If the host drops mid-game the game carries on: the draw loop does not
+  // depend on the host, and ending it would void everyone's paid entry.
   if (room.players.size === 0) {
     rooms.delete(room.code);
     clearRoomTimer(room.code);
@@ -178,6 +200,7 @@ export function createRoom(
     const existingRoom = rooms.get(code);
     if (existingRoom && existingRoom.phase === 'waiting' && existingRoom.players.size <= 1) {
       rooms.delete(code);
+      practiceRooms.delete(code);
       console.log('Room expired: ' + code);
     }
   }, 3 * 60 * 1000);
@@ -255,11 +278,33 @@ export function joinRoom(
   return { room, messages };
 }
 
-export function setWallet(playerId: string, walletAddress: string): { room: Room | null; messages: ServerMessage[] } {
+// `rejected` is set when the change was refused — the caller should
+// tell only the requesting player, not broadcast it to the room.
+export function setWallet(
+  playerId: string,
+  walletAddress: string
+): { room: Room | null; messages: ServerMessage[]; rejected?: string } {
   const room = getPlayerRoom(playerId);
   if (!room) return { room: null, messages: [] };
   const player = room.players.get(playerId);
   if (!player) return { room: null, messages: [] };
+
+  // Once a player has paid (or the game has begun), the wallet that
+  // paid is the wallet that gets paid out. Letting it change after
+  // that would let someone verify a payment as one wallet and then
+  // redirect the prize to another.
+  if (
+    player.walletAddress &&
+    player.walletAddress !== walletAddress &&
+    (player.paidEntryFee || room.phase !== 'waiting')
+  ) {
+    return {
+      room: null,
+      messages: [],
+      rejected: 'Your wallet is locked once you have paid. Reconnect the wallet you paid with.',
+    };
+  }
+
   player.walletAddress = walletAddress;
   if (isReady(player)) clearReadyTimer(playerId);
   return { room, messages: [playersUpdateMessage(room, room.hostId)] };
@@ -268,12 +313,25 @@ export function setWallet(playerId: string, walletAddress: string): { room: Room
 export function markEntryFeePaid(
   playerId: string,
   bundleId: string,
-  currency: 'OREN' | 'SOL'
+  currency: 'OREN' | 'SOL',
+  // The seat the payment was verified for. If the player has moved to a
+  // different room or wallet since, the payment is NOT credited here.
+  verifiedRoomCode: string,
+  verifiedWallet: string
 ): { room: Room | null; messages: ServerMessage[] } {
   const room = getPlayerRoom(playerId);
   if (!room) return { room: null, messages: [] };
   const player = room.players.get(playerId);
   if (!player) return { room: null, messages: [] };
+  if (room.code !== verifiedRoomCode || player.walletAddress !== verifiedWallet) {
+    return { room: null, messages: [{ type: 'entry_fee_rejected', message: 'Your room or wallet changed while the payment was being verified.' }] };
+  }
+  if (room.phase !== 'waiting') {
+    return { room: null, messages: [{ type: 'entry_fee_rejected', message: 'This game has already started.' }] };
+  }
+  if (player.paidEntryFee) {
+    return { room: null, messages: [{ type: 'entry_fee_rejected', message: 'You have already paid for this game.' }] };
+  }
   const bundle = getBundle(room, bundleId);
   if (!bundle) return { room: null, messages: [{ type: 'entry_fee_rejected', message: 'Unknown bundle.' }] };
 
@@ -304,6 +362,11 @@ export function removePlayer(
   if (requesterId === targetPlayerId) {
     return { roomCode: null, messages: [{ type: 'error', message: 'Use leave room instead of removing yourself' }] };
   }
+  // Paid players can't be kicked once the game has started: they would
+  // lose their stake and their chance to win.
+  if (room.phase !== 'waiting') {
+    return { roomCode: null, messages: [{ type: 'error', message: 'Players cannot be removed once the game has started.' }] };
+  }
   const messages = removePlayerFromRoom(room, targetPlayerId);
   if (!messages) {
     return { roomCode: null, messages: [{ type: 'error', message: 'Player not found in room' }] };
@@ -326,17 +389,29 @@ export function startGame(roomCode: string, playerId: string): { room: Room; mes
   if (room.hostId !== playerId) {
     return { room: null as any, messages: [{ type: 'error', message: 'Only the host can start the game' }] };
   }
+  // A room plays exactly one game. Without this, a finished (or
+  // running) room could be started again with everyone's old payment
+  // still counted as "paid" — free replays, and a second draw loop
+  // running alongside the first.
+  if (room.phase !== 'waiting') {
+    return { room: null as any, messages: [{ type: 'error', message: 'This game has already started or finished.' }] };
+  }
   if (room.players.size < 1) {
     return { room: null as any, messages: [{ type: 'error', message: 'Need at least 1 player' }] };
   }
-  const notReady = Array.from(room.players.values()).find(p => !isReady(p));
+  const notReady = Array.from(room.players.values()).find(p => !isReady(p, room));
   if (notReady) {
     return {
       room: null as any,
       messages: [{ type: 'error', message: notReady.name + ' has not finished connecting a wallet and paying for a bundle' }],
     };
   }
-  const seed = roomCode + '-' + Date.now();
+  // Unpredictable seed. The old one (room code + timestamp) was
+  // guessable, which would make the draw order and every card
+  // computable in advance by anyone who knew the algorithm.
+  // Fix the pot now: players who drop out later must not shrink it.
+  room.potOren = Array.from(room.players.values()).reduce((sum, p) => sum + p.amountPaidOren, 0);
+  const seed = roomCode + '-' + randomBytes(16).toString('hex');
   room.drawSequence = generateDrawSequence(seed);
   room.currentDrawIndex = -1;
   room.phase = 'playing';
@@ -345,6 +420,7 @@ export function startGame(roomCode: string, playerId: string): { room: Room; mes
   room.players.forEach((player) => {
     // Each player gets however many cards their verified bundle paid
     // for — no longer a flat 3 for everyone.
+    if (practiceRooms.has(room.code)) player.cardCount = 1;
     player.cards = generateCards(seed + '-' + player.id, player.cardCount);
     clearReadyTimer(player.id);
   });
@@ -387,7 +463,11 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
       // solana.payJackpot() and broadcasting 'jackpot_paid' once the
       // on-chain transfer actually confirms, same as it already does
       // for the normal payout via payWinner/payout_sent.
-      if (room.jackpotEnabled && Math.random() < 1 / room.jackpotOddsOneIn) {
+      //
+      // randomInt(n) is a cryptographically secure draw in [0, n), so
+      // "=== 0" is exactly a 1-in-n chance.
+      const odds = Math.max(2, Math.floor(room.jackpotOddsOneIn));
+      if (room.jackpotEnabled && !practiceRooms.has(room.code) && randomInt(odds) === 0) {
         messages.push({
           type: 'jackpot_won',
           winnerId: pid,
@@ -428,13 +508,14 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
 }
 
 export function getPayoutAmount(room: Room, winnerId: string): number {
+  if (practiceRooms.has(room.code)) return 0;
   if (room.isSolo) {
     const winner = room.players.get(winnerId);
     if (!winner) return 0;
     const multiplier = (winner.bundleId && room.soloMultipliers[winner.bundleId]) || DEFAULT_SOLO_MULTIPLIER;
     return winner.amountPaidOren * multiplier;
   }
-  const pot = Array.from(room.players.values()).reduce((sum, p) => sum + p.amountPaidOren, 0);
+  const pot = room.potOren ?? Array.from(room.players.values()).reduce((sum, p) => sum + p.amountPaidOren, 0);
   return pot * (1 - room.rakePercent);
 }
 

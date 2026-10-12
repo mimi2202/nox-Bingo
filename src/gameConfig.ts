@@ -104,7 +104,12 @@ function validateBundles(bundles: unknown): CardBundle[] {
     throw new Error('bundles must be a non-empty array');
   }
   return bundles.map((b, i) => {
-    if (typeof b.id !== 'string' || !b.id) throw new Error(`bundle[${i}].id must be a non-empty string`);
+    if (typeof b.id !== 'string' || !/^[A-Za-z0-9_-]{1,32}$/.test(b.id) || ['__proto__', 'constructor', 'prototype'].includes(b.id)) {
+      throw new Error(`bundle[${i}].id must be 1-32 letters, numbers, - or _`);
+    }
+    if (bundles.findIndex((o: any) => o && o.id === b.id) !== i) {
+      throw new Error(`bundle[${i}].id "${b.id}" is used more than once`);
+    }
     const cardCount = Math.round(Number(b.cardCount));
     const priceGBP = Number(b.priceGBP);
     if (!Number.isFinite(cardCount) || cardCount < 1 || cardCount > 20) {
@@ -117,7 +122,7 @@ function validateBundles(bundles: unknown): CardBundle[] {
       id: b.id,
       cardCount,
       priceGBP,
-      label: typeof b.label === 'string' && b.label ? b.label : `${cardCount} Card${cardCount === 1 ? '' : 's'}`,
+      label: typeof b.label === 'string' && b.label.trim() ? b.label.trim().slice(0, 40) : `${cardCount} Card${cardCount === 1 ? '' : 's'}`,
     };
   });
 }
@@ -129,7 +134,9 @@ function validateSoloMultipliers(multipliers: unknown, bundles: CardBundle[]): R
   const result: Record<string, number> = {};
   for (const bundle of bundles) {
     const raw = (multipliers as Record<string, unknown>)[bundle.id];
-    const value = Number(raw);
+    // Strings from an admin form are fine; the profitability guard runs
+    // on this converted, validated value.
+    const value = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : NaN;
     if (!Number.isFinite(value) || value <= 0 || value > 1000) {
       throw new Error(`soloMultipliers.${bundle.id} must be a positive number`);
     }
@@ -160,7 +167,7 @@ function validateJackpotOdds(odds: unknown): number {
  * rooms created after this point ever see it (see Room's config
  * snapshot fields in types.ts).
  */
-export async function updateConfig(partial: Partial<GameConfig>): Promise<GameConfig> {
+export function buildNextConfig(partial: Partial<GameConfig>): GameConfig {
   const next: GameConfig = { ...currentConfig };
 
   if (partial.ballCap !== undefined) {
@@ -231,6 +238,11 @@ export async function updateConfig(partial: Partial<GameConfig>): Promise<GameCo
     next.jackpotOddsOneIn = validateJackpotOdds(partial.jackpotOddsOneIn);
   }
 
+  return next;
+}
+
+// Persists an already-validated config and makes it live.
+export async function saveConfig(next: GameConfig): Promise<GameConfig> {
   const { error } = await supabase
     .from('game_config')
     .upsert({ id: 1, data: next, updated_at: new Date().toISOString() });
@@ -241,4 +253,8 @@ export async function updateConfig(partial: Partial<GameConfig>): Promise<GameCo
 
   currentConfig = next;
   return currentConfig;
+}
+
+export async function updateConfig(partial: Partial<GameConfig>): Promise<GameConfig> {
+  return saveConfig(buildNextConfig(partial));
 }

@@ -11,6 +11,11 @@ const OREN_MINT = new PublicKey('6EqY4SZKesXPzVJD3BhdFszYqnossy6t1gU43GSBqkQs');
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
 const DECIMALS = 8;
 
+// A payment can only be submitted as an entry fee within this long of
+// being confirmed on-chain. Combined with the one-time-use signature
+// check, this stops old public transactions being dug up and reused.
+const MAX_TX_AGE_SECONDS = 10 * 60;
+
 function loadTreasuryKeypair(): Keypair {
   const secret = process.env.SOLANA_SERVER_SECRET_KEY;
   if (!secret) {
@@ -91,6 +96,18 @@ export async function payJackpot(winnerWalletAddress: string, amountUiTokens: nu
   return sig;
 }
 
+/** Returns an error string if the transaction is missing a timestamp or too old, else null. */
+function checkFresh(blockTime: number | null | undefined): string | null {
+  if (blockTime === null || blockTime === undefined) {
+    return 'Transaction timestamp is not available yet — try again in a few seconds.';
+  }
+  const ageSeconds = Math.floor(Date.now() / 1000) - blockTime;
+  if (ageSeconds > MAX_TX_AGE_SECONDS) {
+    return 'This payment is too old to be used for an entry.';
+  }
+  return null;
+}
+
 /**
  * Independently verifies an entry-fee payment on-chain. Never trust a
  * client's claim that a transaction succeeded — always check this
@@ -102,6 +119,10 @@ export async function payJackpot(winnerWalletAddress: string, amountUiTokens: nu
  * and not always populated depending on RPC provider/version, which
  * was causing genuine, successfully-debited payments to be rejected
  * as unverifiable because the match could never be found.
+ *
+ * NOTE: this only proves the payment happened and is recent. That each
+ * signature is used only once is enforced by the caller
+ * (usedSignatures.claimSignature) — keep that call in place.
  */
 export async function verifyEntryFeePayment(
   txSignature: string,
@@ -115,6 +136,9 @@ export async function verifyEntryFeePayment(
 
   if (!tx) return { ok: false, reason: 'Transaction not found (not confirmed yet, or invalid signature).' };
   if (tx.meta?.err) return { ok: false, reason: 'Transaction failed on-chain.' };
+
+  const staleReason = checkFresh(tx.blockTime);
+  if (staleReason) return { ok: false, reason: staleReason };
 
   const treasuryAta = (await getAssociatedTokenAddress(OREN_MINT, treasuryKeypair.publicKey)).toBase58();
   const payerPubkey = new PublicKey(expectedPayerWallet);
@@ -153,8 +177,11 @@ export async function verifyEntryFeePayment(
   const payerPreAmount = payerPre ? Number(payerPre.uiTokenAmount.amount) : 0;
   const payerPostAmount = payerPost ? Number(payerPost.uiTokenAmount.amount) : 0;
 
-  if (payerPostAmount >= payerPreAmount) {
-    return { ok: false, reason: "Payer's OREN balance did not decrease — this doesn't look like their payment." };
+  // The payer's own balance must have dropped by the full amount, not
+  // merely "by something" — otherwise a payment from someone else that
+  // happens to touch this wallet's account could pass for theirs.
+  if (payerPreAmount - payerPostAmount < expectedRaw) {
+    return { ok: false, reason: "Payer's OREN balance did not decrease by the expected amount — this doesn't look like their payment." };
   }
 
   return { ok: true };
@@ -183,6 +210,9 @@ export async function verifySolEntryFeePayment(
 
   if (!tx) return { ok: false, reason: 'Transaction not found (not confirmed yet, or invalid signature).' };
   if (tx.meta?.err) return { ok: false, reason: 'Transaction failed on-chain.' };
+
+  const staleReason = checkFresh(tx.blockTime);
+  if (staleReason) return { ok: false, reason: staleReason };
 
   const accountKeys = tx.transaction.message.accountKeys;
   const treasuryAddress = treasuryKeypair.publicKey.toBase58();
