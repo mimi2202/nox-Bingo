@@ -1,4 +1,4 @@
-import { Connection, PublicKey, Keypair, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair, Transaction } from '@solana/web3.js';
 import {
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
@@ -8,13 +8,94 @@ import bs58 from 'bs58';
 
 
 const OREN_MINT = new PublicKey('6EqY4SZKesXPzVJD3BhdFszYqnossy6t1gU43GSBqkQs');
-const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
 const DECIMALS = 8;
 
 // A payment can only be submitted as an entry fee within this long of
 // being confirmed on-chain. Combined with the one-time-use signature
-// check, this stops old public transactions being dug up and reused.
-const MAX_TX_AGE_SECONDS = 10 * 60;
+// check and the wallet-ownership proof, this stops old public
+// transactions being dug up and reused. It was 10 minutes; raised to 60
+// so a player whose check failed during an outage can still confirm the
+// payment they already made instead of being charged again.
+const MAX_TX_AGE_SECONDS = 60 * 60;
+
+// ── RPC endpoints ──────────────────────────────────────────────────
+// SOLANA_RPC_URL is the main provider (Helius). SOLANA_RPC_FALLBACK_URLS
+// can list more providers, comma-separated. The public Solana endpoint
+// for the same network is always tried last, so a blocked or down
+// provider never stops payments and payouts completely.
+const PRIMARY_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
+if (!process.env.SOLANA_RPC_URL) {
+  console.warn('[rpc] SOLANA_RPC_URL is not set, using public DEVNET. Mainnet payments will not verify.');
+}
+const PUBLIC_RPC_URL = /devnet/i.test(PRIMARY_RPC_URL)
+  ? 'https://api.devnet.solana.com'
+  : 'https://api.mainnet-beta.solana.com';
+
+const RPC_URLS = Array.from(new Set([
+  PRIMARY_RPC_URL,
+  ...(process.env.SOLANA_RPC_FALLBACK_URLS || '').split(',').map(u => u.trim()).filter(Boolean),
+  PUBLIC_RPC_URL,
+]));
+
+const connections = RPC_URLS.map(url => ({ url, connection: new Connection(url, 'confirmed') }));
+
+/** Host plus the last 4 characters of any API key, safe to print in logs. */
+function describeRpc(url: string): string {
+  try {
+    const u = new URL(url);
+    const key = u.searchParams.get('api-key');
+    return key ? `${u.host} (key …${key.slice(-4)})` : u.host;
+  } catch {
+    return 'invalid RPC URL';
+  }
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Runs an RPC call against each endpoint in order until one works.
+ * With treatNullAsMiss, a null answer (e.g. "transaction not found yet")
+ * also moves on to the next endpoint, since providers can lag each other.
+ */
+async function withFallback<T>(
+  label: string,
+  call: (connection: Connection) => Promise<T>,
+  treatNullAsMiss = false
+): Promise<T> {
+  let lastError: unknown = null;
+  let sawNull = false;
+  for (const { url, connection } of connections) {
+    try {
+      const result = await call(connection);
+      if (treatNullAsMiss && result === null) {
+        sawNull = true;
+        continue;
+      }
+      return result;
+    } catch (err) {
+      lastError = err;
+      console.warn(`[rpc] ${label} failed on ${describeRpc(url)}: ${errorText(err)}`);
+    }
+  }
+  if (sawNull) return null as T;
+  throw lastError ?? new Error(`${label} failed on every RPC endpoint`);
+}
+
+// Logs which endpoints the server is using and whether each one answers,
+// so a wrong or blocked key shows up in Render's logs at startup.
+async function checkRpcEndpoints() {
+  for (const { url, connection } of connections) {
+    try {
+      const slot = await connection.getSlot();
+      console.log(`[rpc] OK ${describeRpc(url)} (slot ${slot})`);
+    } catch (err) {
+      console.warn(`[rpc] FAILED ${describeRpc(url)}: ${errorText(err)}`);
+    }
+  }
+}
+void checkRpcEndpoints();
 
 function loadTreasuryKeypair(): Keypair {
   const secret = process.env.SOLANA_SERVER_SECRET_KEY;
@@ -32,7 +113,6 @@ function loadTreasuryKeypair(): Keypair {
   }
 }
 
-const connection = new Connection(RPC_URL, 'confirmed');
 const treasuryKeypair = loadTreasuryKeypair();
 
 export const TREASURY_PUBLIC_KEY = treasuryKeypair.publicKey.toBase58();
@@ -42,6 +122,11 @@ export const TREASURY_PUBLIC_KEY = treasuryKeypair.publicKey.toBase58();
  * treasury-to-wallet OREN transfer either way, just called from two
  * different places in the payout flow and logged distinctly so the
  * two kinds of payout stay tellable apart in server logs/history.
+ *
+ * The transaction is built and signed ONCE, then that same signed
+ * transaction is sent through the endpoints in turn. Solana never runs
+ * the same signed transaction twice, so trying another endpoint can
+ * never pay the winner twice.
  */
 async function sendOrenTransfer(recipientWalletAddress: string, amountUiTokens: number): Promise<string> {
   const recipientPubkey = new PublicKey(recipientWalletAddress);
@@ -50,7 +135,7 @@ async function sendOrenTransfer(recipientWalletAddress: string, amountUiTokens: 
 
   const tx = new Transaction();
 
-  const recipientAtaInfo = await connection.getAccountInfo(recipientAta);
+  const recipientAtaInfo = await withFallback('getAccountInfo', c => c.getAccountInfo(recipientAta));
   if (!recipientAtaInfo) {
     tx.add(
       createAssociatedTokenAccountInstruction(treasuryKeypair.publicKey, recipientAta, recipientPubkey, OREN_MINT)
@@ -69,7 +154,26 @@ async function sendOrenTransfer(recipientWalletAddress: string, amountUiTokens: 
     )
   );
 
-  return sendAndConfirmTransaction(connection, tx, [treasuryKeypair], { commitment: 'confirmed' });
+  const { blockhash, lastValidBlockHeight } = await withFallback(
+    'getLatestBlockhash',
+    c => c.getLatestBlockhash('confirmed')
+  );
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = treasuryKeypair.publicKey;
+  tx.sign(treasuryKeypair);
+  const rawTx = tx.serialize();
+  const signature = bs58.encode(tx.signature!);
+
+  await withFallback('sendRawTransaction', c => c.sendRawTransaction(rawTx, { maxRetries: 5 }));
+
+  const confirmation = await withFallback(
+    'confirmTransaction',
+    c => c.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed')
+  );
+  if (confirmation.value.err) {
+    throw new Error(`Transaction failed on-chain: ${JSON.stringify(confirmation.value.err)} (${signature})`);
+  }
+  return signature;
 }
 
 /**
@@ -103,9 +207,17 @@ function checkFresh(blockTime: number | null | undefined): string | null {
   }
   const ageSeconds = Math.floor(Date.now() / 1000) - blockTime;
   if (ageSeconds > MAX_TX_AGE_SECONDS) {
-    return 'This payment is too old to be used for an entry.';
+    return 'This payment is too old to be used for an entry. Contact support for a refund.';
   }
   return null;
+}
+
+function getParsedTransaction(txSignature: string) {
+  return withFallback(
+    'getParsedTransaction',
+    c => c.getParsedTransaction(txSignature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }),
+    true
+  );
 }
 
 /**
@@ -129,10 +241,7 @@ export async function verifyEntryFeePayment(
   expectedPayerWallet: string,
   expectedAmountUiTokens: number
 ): Promise<{ ok: boolean; reason?: string }> {
-  const tx = await connection.getParsedTransaction(txSignature, {
-    commitment: 'confirmed',
-    maxSupportedTransactionVersion: 0,
-  });
+  const tx = await getParsedTransaction(txSignature);
 
   if (!tx) return { ok: false, reason: 'Transaction not found (not confirmed yet, or invalid signature).' };
   if (tx.meta?.err) return { ok: false, reason: 'Transaction failed on-chain.' };
@@ -203,10 +312,7 @@ export async function verifySolEntryFeePayment(
   expectedPayerWallet: string,
   expectedLamports: number
 ): Promise<{ ok: boolean; reason?: string }> {
-  const tx = await connection.getParsedTransaction(txSignature, {
-    commitment: 'confirmed',
-    maxSupportedTransactionVersion: 0,
-  });
+  const tx = await getParsedTransaction(txSignature);
 
   if (!tx) return { ok: false, reason: 'Transaction not found (not confirmed yet, or invalid signature).' };
   if (tx.meta?.err) return { ok: false, reason: 'Transaction failed on-chain.' };
