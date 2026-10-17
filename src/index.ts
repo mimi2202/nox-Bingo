@@ -12,6 +12,7 @@ import { loadConfigFromDb } from './gameConfig';
 import { adminRouter } from './admin';
 import { randomBytes } from 'crypto';
 import { challengeMessage, verifyWalletSignature } from './walletProof';
+import { verifyFarcasterBase64Quirk } from './farcasterProof';
 import { claimSignature, startPayoutRecord, finishPayoutRecord } from './usedSignatures';
 import { userIdFromToken, recordGameResult } from './profileStats';
 
@@ -480,7 +481,13 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
             send(ws, { type: 'error', message: 'Your payment is being verified — one moment.' });
             return;
           }
-          if (!verifyWalletSignature(wallet, walletChallenge, (message as { walletSignature?: unknown }).walletSignature)) {
+          const walletSignature = (message as { walletSignature?: unknown }).walletSignature;
+          // The second check covers Farcaster's wallet, which signs our
+          // challenge text as if it were base64 (see farcasterProof.ts).
+          if (
+            !verifyWalletSignature(wallet, walletChallenge, walletSignature) &&
+            !verifyFarcasterBase64Quirk(wallet, walletChallenge, walletSignature)
+          ) {
             send(ws, { type: 'error', message: 'Could not verify that you own this wallet. Approve the signature request in your wallet and try again.' });
             return;
           }
