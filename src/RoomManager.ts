@@ -53,6 +53,133 @@ export function markPracticeRoom(room: Room): void {
 
 export const roomEvents = new EventEmitter();
 
+// ── Reconnection ───────────────────────────────────────────────────
+// Phones cut a page's connection when the player switches apps (e.g. to
+// Phantom to approve a payment). Instead of removing the player straight
+// away, their seat is held so they can pick up where they left off.
+//
+// How long a dropped player's seat is held before a WAITING room lets it
+// go. Once a game has started the seat is never released mid-game: their
+// cards keep being marked automatically and they can still win and be paid.
+const RECONNECT_GRACE_MS = 60 * 1000;
+// Finished rooms are kept this long so late reconnecters can see the result.
+const FINISHED_ROOM_TTL_MS = 15 * 60 * 1000;
+
+// Secret per-seat token, sent only to that player, that lets a new
+// connection take the seat back.
+const resumeTokens = new Map<string, { roomCode: string; playerId: string }>();
+const playerResumeTokens = new Map<string, string>();
+const graceTimers = new Map<string, NodeJS.Timeout>();
+const finishedRoomTimers = new Map<string, NodeJS.Timeout>();
+
+function issueResumeToken(playerId: string, roomCode: string): string {
+  revokeResumeToken(playerId);
+  const token = randomBytes(32).toString('hex');
+  resumeTokens.set(token, { roomCode, playerId });
+  playerResumeTokens.set(playerId, token);
+  return token;
+}
+
+function revokeResumeToken(playerId: string) {
+  const token = playerResumeTokens.get(playerId);
+  if (token) resumeTokens.delete(token);
+  playerResumeTokens.delete(playerId);
+}
+
+function clearGraceTimer(playerId: string) {
+  const timer = graceTimers.get(playerId);
+  if (timer) {
+    clearTimeout(timer);
+    graceTimers.delete(playerId);
+  }
+}
+
+export function getResumeToken(playerId: string): string | null {
+  return playerResumeTokens.get(playerId) ?? null;
+}
+
+/** Removes a whole room and everything tied to its players. */
+function closeRoom(room: Room) {
+  const playerIds = Array.from(room.players.keys());
+  for (const pid of playerIds) {
+    if (playerRooms.get(pid) === room.code) playerRooms.delete(pid);
+    revokeResumeToken(pid);
+    clearReadyTimer(pid);
+    clearGraceTimer(pid);
+  }
+  rooms.delete(room.code);
+  practiceRooms.delete(room.code);
+  clearRoomTimer(room.code);
+  const finishedTimer = finishedRoomTimers.get(room.code);
+  if (finishedTimer) clearTimeout(finishedTimer);
+  finishedRoomTimers.delete(room.code);
+  roomEvents.emit('room_closed', { roomCode: room.code, playerIds });
+}
+
+function scheduleFinishedRoomCleanup(roomCode: string) {
+  if (finishedRoomTimers.has(roomCode)) return;
+  const timer = setTimeout(() => {
+    finishedRoomTimers.delete(roomCode);
+    const room = rooms.get(roomCode);
+    if (room) closeRoom(room);
+  }, FINISHED_ROOM_TTL_MS);
+  finishedRoomTimers.set(roomCode, timer);
+}
+
+/**
+ * Called when a player's connection drops. Holds their seat instead of
+ * removing them. Returns a players_update for the room so others can
+ * see the player is reconnecting.
+ */
+export function markDisconnected(playerId: string): { roomCode: string | null; messages: ServerMessage[] } {
+  const room = getPlayerRoom(playerId);
+  if (!room) return { roomCode: null, messages: [] };
+  const player = room.players.get(playerId);
+  if (!player) return { roomCode: null, messages: [] };
+
+  player.connected = false;
+  clearGraceTimer(playerId);
+  const roomCode = room.code;
+  const timer = setTimeout(() => {
+    graceTimers.delete(playerId);
+    const current = rooms.get(roomCode);
+    const p = current?.players.get(playerId);
+    if (!current || !p || p.connected) return;
+    // Only a room that hasn't started lets the seat go. Mid-game the
+    // player stays in: their cards are marked automatically and they can
+    // still win. Finished rooms are cleaned up on their own timer.
+    if (current.phase === 'waiting') {
+      const messages = removePlayerFromRoom(current, playerId);
+      if (messages) {
+        roomEvents.emit('player_removed', { roomCode, playerId, messages, reason: 'disconnected' });
+      }
+    }
+  }, RECONNECT_GRACE_MS);
+  graceTimers.set(playerId, timer);
+
+  return { roomCode, messages: [playersUpdateMessage(room, room.hostId)] };
+}
+
+/**
+ * Lets a new connection take back a held seat. Returns the seat's
+ * original player id, which the connection must use from now on.
+ */
+export function resumePlayer(
+  token: string
+): { room: Room; playerId: string; messages: ServerMessage[] } | { error: 'expired' } {
+  const entry = resumeTokens.get(token);
+  if (!entry) return { error: 'expired' };
+  const room = rooms.get(entry.roomCode);
+  const player = room?.players.get(entry.playerId);
+  if (!room || !player || playerRooms.get(entry.playerId) !== room.code) {
+    resumeTokens.delete(token);
+    return { error: 'expired' };
+  }
+  clearGraceTimer(entry.playerId);
+  player.connected = true;
+  return { room, playerId: entry.playerId, messages: [playersUpdateMessage(room, room.hostId)] };
+}
+
 function generateRoomCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -70,6 +197,8 @@ function getPlayerList(room: Room) {
     paidEntryFee: p.paidEntryFee,
     bundleId: p.bundleId,
     cardCount: p.cardCount,
+    // false while the player's connection has dropped and their seat is held
+    connected: p.connected !== false,
   }));
 }
 function playersUpdateMessage(room: Room, hostId: string | null): ServerMessage {
@@ -120,6 +249,8 @@ function removePlayerFromRoom(room: Room, playerId: string): ServerMessage[] | n
   room.players.delete(playerId);
   playerRooms.delete(playerId);
   clearReadyTimer(playerId);
+  clearGraceTimer(playerId);
+  revokeResumeToken(playerId);
 
   // A paid seat that disappears before the game starts: the stake is
   // already on-chain and the entry signature is burned, so leave a record
@@ -135,8 +266,7 @@ function removePlayerFromRoom(room: Room, playerId: string): ServerMessage[] | n
   // If the host drops mid-game the game carries on: the draw loop does not
   // depend on the host, and ending it would void everyone's paid entry.
   if (room.players.size === 0) {
-    rooms.delete(room.code);
-    clearRoomTimer(room.code);
+    closeRoom(room);
   } else if (wasHost) {
     room.hostId = Array.from(room.players.keys())[0];
   }
@@ -199,13 +329,13 @@ export function createRoom(
   const timer = setTimeout(() => {
     const existingRoom = rooms.get(code);
     if (existingRoom && existingRoom.phase === 'waiting' && existingRoom.players.size <= 1) {
-      rooms.delete(code);
-      practiceRooms.delete(code);
+      closeRoom(existingRoom);
       console.log('Room expired: ' + code);
     }
   }, 3 * 60 * 1000);
   roomTimers.set(code, timer);
   scheduleReadyTimeout(playerId, code);
+  issueResumeToken(playerId, code);
   return {
     room,
     messages: [
@@ -258,6 +388,7 @@ export function joinRoom(
   playerRooms.set(playerId, roomCode);
   clearRoomTimer(roomCode);
   scheduleReadyTimeout(playerId, roomCode);
+  issueResumeToken(playerId, roomCode);
   const messages: ServerMessage[] = [
     { type: 'player_joined', playerId, playerName, playerCount: room.players.size },
     playersUpdateMessage(room, room.hostId),
@@ -504,6 +635,7 @@ export function drawBall(roomCode: string): { room: Room; messages: ServerMessag
       winnerName: room.players.get(room.winningPlayerId!)?.name || null,
     });
   }
+  if (room.phase === 'finished') scheduleFinishedRoomCleanup(room.code);
   return { room, messages };
 }
 
