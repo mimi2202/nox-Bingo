@@ -5,7 +5,8 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { PublicKey } from '@solana/web3.js';
 import { ClientMessage, Room } from './types';
-import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom, setWallet, markEntryFeePaid, removePlayer, roomEvents, getPayoutAmount, orenEquivalent, usdtEquivalent, isPracticeRoom, markPracticeRoom } from './RoomManager';
+// (Room is also used by the reconnect snapshot below.)
+import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom, setWallet, markEntryFeePaid, removePlayer, roomEvents, getPayoutAmount, orenEquivalent, usdtEquivalent, isPracticeRoom, markPracticeRoom, markDisconnected, resumePlayer, getResumeToken } from './RoomManager';
 import { TREASURY_PUBLIC_KEY, payWinner, payJackpot, verifyEntryFeePayment, verifySolEntryFeePayment } from './solana';
 import { getSolUsdPrice } from './pyth';
 import { loadConfigFromDb } from './gameConfig';
@@ -87,7 +88,68 @@ function send(ws: WebSocket, message: object) {
     ws.send(JSON.stringify(message));
   }
 }
+// ── Room history for reconnecting players ─────────────────────────
+// Every room-wide game event is kept, so a player who reconnects can be
+// replayed everything they missed (balls, bonuses, the result, payouts)
+// and end up with exactly the same screen as everyone else.
+const REPLAYED_EVENT_TYPES = new Set([
+  'players_update', 'player_joined', 'player_left', 'game_starting', 'ball_drawn',
+  'bingo', 'nox_bonus', 'game_over', 'payout_sent', 'payout_error',
+  'jackpot_won', 'jackpot_paid', 'jackpot_payout_error', 'entry_fee_confirmed',
+]);
+const MAX_ROOM_HISTORY = 500;
+const roomHistory = new Map<string, object[]>();
+
+function recordRoomEvent(roomCode: string, message: object) {
+  const type = (message as { type?: unknown }).type;
+  if (typeof type !== 'string' || !REPLAYED_EVENT_TYPES.has(type)) return;
+  const history = roomHistory.get(roomCode) ?? [];
+  history.push(message);
+  if (history.length > MAX_ROOM_HISTORY) history.shift();
+  roomHistory.set(roomCode, history);
+}
+
+roomEvents.on('room_closed', ({ roomCode, playerIds }: { roomCode: string; playerIds: string[] }) => {
+  roomHistory.delete(roomCode);
+  for (const pid of playerIds) {
+    if (!connections.has(pid)) userIds.delete(pid);
+  }
+});
+
+/**
+ * Brings a reconnected player fully up to date: their own seat details,
+ * their cards, then every room event in order. The client resets its
+ * game state on resume_ok and rebuilds it from these messages.
+ */
+function sendResumeSnapshot(ws: WebSocket, room: Room, pid: string) {
+  const player = room.players.get(pid);
+  send(ws, { type: 'resume_ok', roomCode: room.code, playerId: pid });
+  send(ws, {
+    type: 'room_created',
+    roomCode: room.code,
+    playerId: pid,
+    hostId: room.hostId,
+    maxPlayers: room.maxPlayers,
+    noxBonusDisplay: room.noxBonusDisplay,
+    orenToGbpRate: room.orenToGbpRate,
+    gbpToUsdtRate: room.gbpToUsdtRate,
+    bundles: room.bundles,
+    jackpotEnabled: room.jackpotEnabled,
+    jackpotAmountOren: room.jackpotAmountOren,
+    practice: isPracticeRoom(room.code),
+    isSolo: room.isSolo,
+    soloMultipliers: room.soloMultipliers,
+    rakePercent: room.rakePercent,
+  });
+  if (room.phase !== 'waiting' && player && player.cards.length > 0) {
+    send(ws, { type: 'cards_dealt', cards: player.cards });
+  }
+  for (const msg of roomHistory.get(room.code) ?? []) send(ws, msg);
+  send(ws, { type: 'resume_complete', roomCode: room.code });
+}
+
 function broadcastToRoom(roomCode: string, message: object, excludePlayerId?: string) {
+  recordRoomEvent(roomCode, message);
   connections.forEach((ws, playerId) => {
     const room = getPlayerRoom(playerId);
     if (room && room.code === roomCode && playerId !== excludePlayerId) {
@@ -330,6 +392,7 @@ roomEvents.on('player_removed', ({ roomCode, playerId, messages, reason }) => {
   }
   connections.delete(playerId);
   playerNames.delete(playerId);
+  userIds.delete(playerId);
   console.log('Player ' + playerId + ' auto-removed from ' + roomCode + ' (' + reason + ')');
 });
 
@@ -364,7 +427,10 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
   }
   connectionsPerIp.set(ip, open + 1);
 
-  const playerId = uuidv4();
+  // `let`, not `const`: when this connection resumes a held seat, it takes
+  // over that seat's original player id, and every handler below then
+  // acts for that seat.
+  let playerId = uuidv4();
   connections.set(playerId, ws);
   alive.set(ws, true);
   ws.on('pong', () => alive.set(ws, true));
@@ -426,6 +492,48 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
             });
           pendingIdentify = p;
         }
+        return;
+      }
+      // A reconnecting player takes back their held seat with the secret
+      // token the server gave them when they joined.
+      if ((parsed as { type?: unknown }).type === 'resume') {
+        const resumeToken = (parsed as { resumeToken?: unknown }).resumeToken;
+        if (typeof resumeToken !== 'string' || !/^[0-9a-f]{64}$/.test(resumeToken)) {
+          send(ws, { type: 'resume_failed', reason: 'invalid' });
+          return;
+        }
+        if (getPlayerRoom(playerId)) {
+          send(ws, { type: 'resume_failed', reason: 'already_in_room' });
+          return;
+        }
+        const result = resumePlayer(resumeToken);
+        if ('error' in result) {
+          send(ws, { type: 'resume_failed', reason: result.error });
+          return;
+        }
+        const seatId = result.playerId;
+        const room = result.room;
+
+        // If the old connection is somehow still open (e.g. another tab),
+        // it hands over to this one.
+        const previous = connections.get(seatId);
+        if (previous && previous !== ws) {
+          send(previous, { type: 'session_replaced' });
+          previous.close(4000, 'Session resumed elsewhere');
+        }
+
+        // Carry over anything already known about this connection.
+        connections.delete(playerId);
+        const uid = userIds.get(playerId);
+        if (uid && !userIds.has(seatId)) userIds.set(seatId, uid);
+        userIds.delete(playerId);
+        playerNames.delete(playerId);
+
+        playerId = seatId;
+        connections.set(playerId, ws);
+        sendResumeSnapshot(ws, room, playerId);
+        result.messages.forEach(msg => broadcastToRoom(room.code, msg, playerId));
+        console.log('Player resumed: ' + playerId + ' in ' + room.code);
         return;
       }
       {
@@ -493,6 +601,9 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
             });
           }
           messages.forEach(msg => {
+            if (msg.type === 'room_created') {
+              Object.assign(msg, { isSolo: room.isSolo, soloMultipliers: room.soloMultipliers, rakePercent: room.rakePercent });
+            }
             if (msg.type === 'cards_dealt') {
               send(ws, msg);
             } else {
@@ -500,6 +611,9 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
               broadcastToRoom(room.code, msg, playerId);
             }
           });
+          // Secret token that lets this player take their seat back if
+          // their connection drops. Sent only to them.
+          send(ws, { type: 'session', roomCode: room.code, playerId, resumeToken: getResumeToken(playerId) });
           console.log('Room created: ' + room.code + ' by ' + name);
           break;
         }
@@ -525,12 +639,16 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
             messages.forEach(msg => {
               // room_created carries the JOINER's own playerId, so only the
               // joiner may receive it — everyone else would adopt it as theirs.
+              if (msg.type === 'room_created') {
+                Object.assign(msg, { isSolo: room.isSolo, soloMultipliers: room.soloMultipliers, rakePercent: room.rakePercent });
+              }
               if (msg.type === 'cards_dealt' || msg.type === 'room_created') {
                 send(ws, msg);
               } else {
                 broadcastToRoom(room.code, msg);
               }
             });
+            send(ws, { type: 'session', roomCode: room.code, playerId, resumeToken: getResumeToken(playerId) });
             console.log(name + ' joined room ' + room.code);
           } else {
             messages.forEach(msg => send(ws, msg));
@@ -724,16 +842,30 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
     if (left <= 1) connectionsPerIp.delete(ip);
     else connectionsPerIp.set(ip, left - 1);
 
-    const { roomCode, messages } = leaveRoom(playerId);
+    // This connection was replaced by a resumed one, or the player already
+    // left: the seat belongs to someone else's connection now (or to no
+    // one), so leave it alone.
+    if (connections.get(playerId) !== ws) {
+      if (!connections.has(playerId) && !getPlayerRoom(playerId)) {
+        playerNames.delete(playerId);
+        userIds.delete(playerId);
+        verifying.delete(playerId);
+      }
+      return;
+    }
+
+    connections.delete(playerId);
+    // Hold the seat instead of removing the player (see RoomManager).
+    const { roomCode, messages } = markDisconnected(playerId);
     if (roomCode) {
       messages.forEach(msg => broadcastToRoom(roomCode, msg));
+      console.log('Player disconnected, seat held: ' + playerId + ' in ' + roomCode);
+    } else {
+      playerNames.delete(playerId);
+      userIds.delete(playerId);
+      verifying.delete(playerId);
+      console.log('Player disconnected: ' + playerId);
     }
-    connections.delete(playerId);
-    playerNames.delete(playerId);
-    userIds.delete(playerId);
-    verifying.delete(playerId);
-    shareResultIds.delete(playerId);
-    console.log('Player disconnected: ' + playerId);
   });
 });
 
