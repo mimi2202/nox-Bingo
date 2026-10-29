@@ -16,6 +16,7 @@ import { challengeMessage, verifyWalletSignature } from './walletProof';
 import { verifyFarcasterBase64Quirk } from './farcasterProof';
 import { claimSignature, startPayoutRecord, finishPayoutRecord } from './usedSignatures';
 import { userIdFromToken, recordGameResult } from './profileStats';
+import { createShareResult, setShareName } from './shareResults';
 
 const PORT = parseInt(process.env.PORT || '3001');
 
@@ -78,6 +79,9 @@ const userIds = new Map<string, string>();
 const verifying = new Set<string>();
 const connectionsPerIp = new Map<string, number>();
 const alive = new WeakMap<WebSocket, boolean>();
+// Connection id -> id of that player's latest shareable result. Only the
+// player who owns a result may set the name shown on its share card.
+const shareResultIds = new Map<string, string>();
 
 function send(ws: WebSocket, message: object) {
   if (ws.readyState === WebSocket.OPEN) {
@@ -187,6 +191,45 @@ function cleanWallet(raw: unknown): string | null {
   } catch {
     return null;
   }
+}
+
+// Name shown on a share card. Farcaster usernames are restricted to their
+// real character set; typed names must not look like a link.
+function cleanShareName(raw: unknown, source: 'farcaster' | 'typed'): string | null {
+  if (typeof raw !== 'string') return null;
+  let name = raw.replace(/[\u0000-\u001f\u007f<>]/g, '').trim();
+  if (source === 'typed') {
+    name = name.replace(/^@+/, '').trim();
+    if (/http|www\.|\.com/i.test(name)) return null;
+  } else if (!/^[a-z0-9_.-]+$/.test(name)) {
+    return null;
+  }
+  name = name.slice(0, 20);
+  return name.length > 0 ? name : null;
+}
+
+// Saves each player's result when a paid game ends and tells them its id,
+// so they can share it. Amounts come from the room, never from a client.
+function recordShareResults(room: Room, winnerId: string | null, noxBonusHits: Map<string, number>, jackpotOren: number) {
+  if (isPracticeRoom(room.code)) return;
+  room.players.forEach((player, pid) => {
+    const isWinner = pid === winnerId;
+    const amountOren = isWinner
+      ? Math.floor(getPayoutAmount(room, pid) * 100) / 100
+      : Math.round(player.amountPaidOren * 100) / 100;
+    if (!(amountOren > 0)) return;
+    const noxBonus = (noxBonusHits.get(pid) ?? 0) * room.noxBonusDisplay;
+    const jackpot = isWinner ? jackpotOren : 0;
+    void createShareResult({ roomCode: room.code, outcome: isWinner ? 'win' : 'loss', amountOren, noxBonus, jackpotOren: jackpot })
+      .then(resultId => {
+        if (!resultId) return;
+        const ws = connections.get(pid);
+        if (!ws) return;
+        shareResultIds.set(pid, resultId);
+        send(ws, { type: 'share_result', resultId, outcome: isWinner ? 'win' : 'loss', amountOren, noxBonus });
+        if (jackpot > 0) send(ws, { type: 'share_result_jackpot', resultId, jackpotOren: jackpot });
+      });
+  });
 }
 
 function looksUncertain(err: unknown): boolean {
@@ -501,6 +544,29 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
         }
       }
 
+      // The player picks the name shown on their own share card, once.
+      if ((parsed as { type?: unknown }).type === 'set_share_name') {
+        const { resultId, displayName, source } = parsed as { resultId?: unknown; displayName?: unknown; source?: unknown };
+        if (typeof resultId !== 'string' || shareResultIds.get(playerId) !== resultId) {
+          send(ws, { type: 'error', message: 'That result cannot be shared from here.' });
+          return;
+        }
+        if (source !== 'farcaster' && source !== 'typed') {
+          send(ws, { type: 'error', message: 'Invalid name source.' });
+          return;
+        }
+        const name = cleanShareName(displayName, source);
+        if (!name) {
+          send(ws, { type: 'error', message: 'Please enter a name of 1-20 characters, without links.' });
+          return;
+        }
+        void setShareName(resultId, name, source).then(ok => {
+          if (ok) send(ws, { type: 'share_name_saved', resultId });
+          else send(ws, { type: 'error', message: 'The name for this result is already set.' });
+        });
+        return;
+      }
+
       const message = parsed as ClientMessage;
       switch (message.type) {
         case 'create_room': {
@@ -708,6 +774,10 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
           });
           broadcastToRoom(startedRoom.code, { type: 'game_starting', countdown: 3 });
           let drawInterval: NodeJS.Timeout;
+          // For share cards: NOX bonus hits per player, and the jackpot
+          // (announced in the same batch as 'bingo', before 'game_over').
+          const noxBonusHits = new Map<string, number>();
+          let jackpotOren = 0;
           setTimeout(() => {
             drawInterval = setInterval(() => {
               const result = drawBall(startedRoom.code);
@@ -726,6 +796,10 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
                 // never a replacement for it.
                 if (msg.type === 'jackpot_won') {
                   handleJackpotPayout(startedRoom, msg.winnerId, msg.amount);
+                  jackpotOren = msg.amount;
+                }
+                if (msg.type === 'nox_bonus') {
+                  noxBonusHits.set(msg.winnerId, (noxBonusHits.get(msg.winnerId) ?? 0) + 1);
                 }
                 // Game finished normally: every signed-in player who
                 // took part gets a game played, and the winner a win.
@@ -736,6 +810,7 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
                     const uid = userIds.get(pid);
                     if (uid) void recordGameResult(uid, 1, pid === msg.winnerId ? 1 : 0, 0);
                   });
+                  recordShareResults(startedRoom, msg.winnerId, noxBonusHits, jackpotOren);
                 }
               });
               if (result.room.phase === 'finished') {
