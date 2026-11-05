@@ -172,6 +172,10 @@ export type ServerMessage =
   | { type: 'removed_from_room'; reason: 'wallet_timeout' | 'fee_timeout' | 'host_removed' }
   | { type: 'error'; message: string }
   | { type: 'wallet_challenge'; message: string }
+  // Sent only to a guest who won a free game. claimToken is a secret: it is
+  // their only way to claim the prize and must never be logged.
+  | { type: 'guest_prize'; claimToken: string; amountOren: number; expiresAt: string }
+  | { type: 'guest_prize_unavailable'; reason: 'limit_reached' | 'daily_budget' | 'disabled' }
   | {
       type: 'players_update';
       players: {

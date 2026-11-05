@@ -55,7 +55,7 @@ function recentFailures(): number {
   return failedLogins.length;
 }
 
-function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
+export function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) {
     res.status(401).json({ error: 'Missing admin token' });

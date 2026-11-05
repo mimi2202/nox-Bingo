@@ -3,20 +3,21 @@ import express from 'express';
 import cors from 'cors';
 import WebSocket, { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
-import { PublicKey } from '@solana/web3.js';
 import { ClientMessage, Room } from './types';
 // (Room is also used by the reconnect snapshot below.)
-import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom, setWallet, markEntryFeePaid, removePlayer, roomEvents, getPayoutAmount, orenEquivalent, usdtEquivalent, isPracticeRoom, markPracticeRoom, markDisconnected, resumePlayer, getResumeToken } from './RoomManager';
+import { createRoom, joinRoom, leaveRoom, startGame, drawBall, getPlayerRoom, getRoom, setWallet, markEntryFeePaid, removePlayer, roomEvents, getPayoutAmount, orenEquivalent, usdtEquivalent, isPracticeRoom, markPracticeRoom, markDisconnected, resumePlayer, getResumeToken, singleCardSoloPrize, toPayableOren } from './RoomManager';
 import { TREASURY_PUBLIC_KEY, payWinner, payJackpot, verifyEntryFeePayment, verifySolEntryFeePayment } from './solana';
 import { getSolUsdPrice } from './pyth';
-import { loadConfigFromDb } from './gameConfig';
-import { adminRouter } from './admin';
+import { getConfig, loadConfigFromDb } from './gameConfig';
+import { adminRouter, requireAdminAuth } from './admin';
 import { randomBytes } from 'crypto';
-import { challengeMessage, verifyWalletSignature } from './walletProof';
+import { challengeMessage, cleanWallet, verifyWalletSignature } from './walletProof';
 import { verifyFarcasterBase64Quirk } from './farcasterProof';
 import { claimSignature, startPayoutRecord, finishPayoutRecord } from './usedSignatures';
 import { userIdFromToken, recordGameResult } from './profileStats';
 import { createShareResult, setShareName } from './shareResults';
+import { allowGuestGame, awardGuestPrize, createGuestPrizeAdminRouter, createGuestPrizeRouter, GuestPrizeDeps, HeldGuestPrizes, loadGuestPrizeSettings, PayoutResult, startGuestPrizeJobs } from './guestPrizes';
+import { createSupabaseGuestPrizeStore } from './guestPrizeStore';
 
 const PORT = parseInt(process.env.PORT || '3001');
 
@@ -66,8 +67,30 @@ app.get('/sol-price', async (_req, res) => {
   }
 });
 
+// Guest prizes (master switch: GUEST_PRIZE_ENABLED). Switched off, none of
+// this exists: no routes, no job, no new messages.
+const guestPrizeSettings = loadGuestPrizeSettings();
+const guestPrizes: GuestPrizeDeps | null = guestPrizeSettings.enabled
+  ? {
+      settings: guestPrizeSettings,
+      store: createSupabaseGuestPrizeStore(),
+      prizeAmount: () => singleCardSoloPrize(getConfig()),
+      userIdFromToken,
+      payout: payGuestPrize,
+    }
+  : null;
+const heldGuestPrizes = guestPrizes ? new HeldGuestPrizes(guestPrizes.store) : null;
+if (guestPrizes && heldGuestPrizes) {
+  app.use('/guest-prize', createGuestPrizeRouter(guestPrizes));
+  app.use('/admin/guest-prizes', requireAdminAuth, createGuestPrizeAdminRouter(guestPrizes));
+  startGuestPrizeJobs(guestPrizes.store);
+  roomEvents.on('room_closed', ({ roomCode }: { roomCode: string }) => {
+    void heldGuestPrizes.roomClosed(roomCode);
+  });
+}
+
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, maxPayload: MAX_PAYLOAD_BYTES });
+const wss =new WebSocketServer({ server, maxPayload: MAX_PAYLOAD_BYTES });
 
 const connections = new Map<string, WebSocket>();
 const playerNames = new Map<string, string>();
@@ -145,6 +168,9 @@ function sendResumeSnapshot(ws: WebSocket, room: Room, pid: string) {
     send(ws, { type: 'cards_dealt', cards: player.cards });
   }
   for (const msg of roomHistory.get(room.code) ?? []) send(ws, msg);
+  // Kept out of the room history because the claim token is a secret. Only
+  // this seat's holder gets here, with the seat's own resume token.
+  heldGuestPrizes?.resend(room.code, msg => send(ws, msg));
   send(ws, { type: 'resume_complete', roomCode: room.code });
 }
 
@@ -181,16 +207,6 @@ function cleanName(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
   const name = raw.replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, 20);
   return name.length > 0 ? name : null;
-}
-
-// Returns the canonical address if raw is a real Solana public key, else null.
-function cleanWallet(raw: unknown): string | null {
-  if (typeof raw !== 'string' || raw.length < 32 || raw.length > 44) return null;
-  try {
-    return new PublicKey(raw).toBase58() === raw ? raw : null;
-  } catch {
-    return null;
-  }
 }
 
 // Name shown on a share card. Farcaster usernames are restricted to their
@@ -257,7 +273,7 @@ async function handleWinnerPayout(room: Room, winnerId: string) {
     return;
   }
 
-  const totalPrize = Math.floor(getPayoutAmount(room, winnerId) * 100) / 100;
+  const totalPrize = toPayableOren(getPayoutAmount(room, winnerId));
   if (!(totalPrize > 0)) {
     console.error('[payout] computed prize is 0, room ' + roomCode);
     return;
@@ -315,6 +331,23 @@ async function handleJackpotPayout(room: Room, winnerId: string, amount: number)
       type: 'jackpot_payout_error',
       message: 'Jackpot payout failed. Support may need to send it manually.',
     });
+  }
+}
+
+// Same transfer and same payout ledger as a game win. A function
+// declaration, so the guest prize setup near the top of this file can use it.
+async function payGuestPrize(wallet: string, amount: number, roomCode: string): Promise<PayoutResult> {
+  const recordId = await startPayoutRecord('prize', roomCode, wallet, amount);
+  try {
+    const txSignature = await payWinner(wallet, amount);
+    await finishPayoutRecord(recordId, 'sent', txSignature);
+    return { ok: true, txSignature };
+  } catch (err) {
+    console.error('payWinner failed (guest prize):', err);
+    const unconfirmed = looksUncertain(err);
+    const error = err instanceof Error ? err.message : String(err);
+    await finishPayoutRecord(recordId, unconfirmed ? 'unconfirmed' : 'failed', null, error);
+    return { ok: false, unconfirmed, error };
   }
 }
 
@@ -579,6 +612,11 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
             send(ws, { type: 'error', message: 'Your payment is being verified — one moment.' });
             return;
           }
+          // Guest wins are worth real OREN, so free games are limited per IP.
+          if (guestPrizes && message.isSolo === true && !userIds.has(playerId) && !allowGuestGame(ip)) {
+            send(ws, { type: 'error', message: 'Too many free games from this connection. Please try again later.' });
+            return;
+          }
           leaveCurrentRoom();
           playerNames.set(playerId, name);
           const { room, messages } = createRoom(
@@ -789,6 +827,26 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
                 broadcastToRoom(startedRoom.code, msg);
                 if (msg.type === 'bingo') {
                   handleWinnerPayout(startedRoom, msg.winnerId);
+                  // A practice room holds one player, the guest who started
+                  // it. They may have reconnected on a new socket or be away
+                  // right now, so look up their connection when delivering.
+                  if (guestPrizes && heldGuestPrizes && isPracticeRoom(startedRoom.code)) {
+                    const roomCode = startedRoom.code;
+                    const winnerId = msg.winnerId;
+                    void awardGuestPrize(guestPrizes, {
+                      roomCode,
+                      ip,
+                      isRoomOpen: () => getRoom(roomCode) === startedRoom,
+                      deliver: (prizeMessage, prizeId) => {
+                        heldGuestPrizes.deliver(roomCode, prizeMessage, prizeId, m => {
+                          const current = connections.get(winnerId);
+                          if (!current || current.readyState !== WebSocket.OPEN) return false;
+                          send(current, m);
+                          return true;
+                        });
+                      },
+                    });
+                  }
                 }
                 // jackpot_won is pushed right alongside 'bingo' by
                 // drawBall when the slim random chance hits — this is
@@ -878,5 +936,11 @@ loadConfigFromDb()
       console.log('NoxBingo server running on port ' + PORT);
       console.log('Features: practice-games, wallet-proof');
       console.log('Treasury pubkey: ' + TREASURY_PUBLIC_KEY);
+      if (guestPrizes) {
+        console.log('Guest prizes ON: ' + singleCardSoloPrize(getConfig()) + ' OREN per win, held ' + guestPrizeSettings.ttlHours + 'h, budget ' + guestPrizeSettings.dailyBudgetOren + ' OREN/day');
+        if (TRUST_PROXY_HOPS === 0) {
+          console.warn('[guest-prize] TRUST_PROXY_HOPS is 0. Behind a proxy every guest looks like the proxy address, which breaks the per-IP prize and game limits.');
+        }
+      }
     });
   });

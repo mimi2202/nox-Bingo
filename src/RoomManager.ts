@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { randomBytes, randomInt } from 'crypto';
-import { Room, Player, ServerMessage, CardBundle } from './types';
+import { Room, Player, ServerMessage, CardBundle, GameConfig } from './types';
 import { generateCards, generateDrawSequence, checkForWin, autoDaub, getLetterForNumber } from './GameEngine';
 import { getConfig } from './gameConfig';
 
@@ -13,8 +13,8 @@ function getBundle(room: Room, bundleId: string): CardBundle | undefined {
 // OREN amount owed, and the figure recorded as "stake value" for a
 // SOL payer too, so pot/payout math never has to care which currency
 // someone actually paid in.
-export function orenEquivalent(room: Room, bundle: CardBundle): number {
-  return bundle.priceGBP / room.orenToGbpRate;
+export function orenEquivalent(rates: Pick<Room, 'orenToGbpRate'>, bundle: CardBundle): number {
+  return bundle.priceGBP / rates.orenToGbpRate;
 }
 
 // The USDT-equivalent value of a bundle's stake — the bridge currency
@@ -25,6 +25,25 @@ export function usdtEquivalent(room: Room, bundle: CardBundle): number {
 }
 
 const DEFAULT_SOLO_MULTIPLIER = 3.5;
+
+function soloPayout(stakeOren: number, bundleId: string | null, multipliers: Record<string, number>): number {
+  const multiplier = (bundleId && multipliers[bundleId]) || DEFAULT_SOLO_MULTIPLIER;
+  return stakeOren * multiplier;
+}
+
+// Prizes are paid to 2 decimal places, always rounded down.
+export function toPayableOren(amount: number): number {
+  return Math.floor(amount * 100) / 100;
+}
+
+// What a paid 1-card solo win pays under this config. A guest prize is
+// exactly this, read from the live config at the moment of the win. Null if
+// the admin config no longer has a 'single' bundle.
+export function singleCardSoloPrize(config: GameConfig): number | null {
+  const bundle = config.bundles.find(b => b.id === 'single');
+  if (!bundle) return null;
+  return toPayableOren(soloPayout(orenEquivalent(config, bundle), bundle.id, config.soloMultipliers));
+}
 
 // A player has this long to both connect a wallet AND have a bundle
 // payment verified before being auto-removed from a still-waiting room.
@@ -644,8 +663,7 @@ export function getPayoutAmount(room: Room, winnerId: string): number {
   if (room.isSolo) {
     const winner = room.players.get(winnerId);
     if (!winner) return 0;
-    const multiplier = (winner.bundleId && room.soloMultipliers[winner.bundleId]) || DEFAULT_SOLO_MULTIPLIER;
-    return winner.amountPaidOren * multiplier;
+    return soloPayout(winner.amountPaidOren, winner.bundleId, room.soloMultipliers);
   }
   const pot = room.potOren ?? Array.from(room.players.values()).reduce((sum, p) => sum + p.amountPaidOren, 0);
   return pot * (1 - room.rakePercent);

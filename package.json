@@ -7,7 +7,8 @@
     "dev": "npx tsx src/index.ts",
     "build": "npx tsc",
     "start": "node dist/index.js",
-    "postinstall": "npm run build"
+    "postinstall": "npm run build",
+    "test": "node --import tsx --test test/guestPrizes.test.ts"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.9",
@@ -26,5 +27,9 @@
     "typescript": "^5.3.3",
     "uuid": "^9.0.0",
     "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.15",
+    "tsx": "^4.23.15"
   }
 }

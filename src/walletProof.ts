@@ -7,6 +7,16 @@ import { PublicKey } from '@solana/web3.js';
 
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
+// Returns the canonical address if raw is a real Solana public key, else null.
+export function cleanWallet(raw: unknown): string | null {
+  if (typeof raw !== 'string' || raw.length < 32 || raw.length > 44) return null;
+  try {
+    return new PublicKey(raw).toBase58() === raw ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
 export function challengeMessage(nonce: string): string {
   return 'NoxBingo wallet verification\nChallenge: ' + nonce;
 }
